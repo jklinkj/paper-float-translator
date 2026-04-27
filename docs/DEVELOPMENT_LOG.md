@@ -128,3 +128,41 @@
 - 同一段重复翻译仍可正常命中缓存。
 - 自动复制模式仍保留给需要一键触发的场景。
 - macOS 双复制模式作为实验功能，不影响默认快捷键模式。
+
+### Cmd+C+C Only Trigger And Low-Latency Watcher
+
+收敛取词入口，降低 macOS 双复制触发延迟。
+
+主要内容：
+
+- 移除全局翻译快捷键、取词方式选择和自动模拟复制路径。
+- App 启动后常驻 macOS `NSPasteboard.changeCount` watcher。
+- 双复制 watcher 轮询间隔从 `250ms` 降到 `50ms`。
+- 双复制触发窗口固定为 `900ms`，不再暴露为设置项。
+- 对同一文本加入短暂触发冷却，避免多连复制重复请求。
+- 启动时预热隐藏浮窗，降低首次触发的窗口加载延迟。
+- 设置页只保留 API Key、模型、翻译模式、浮窗宽度、PDF 清洗、缓存和双复制监听状态。
+- 设置类型移除 `shortcut`、`triggerMode`、`doubleCopyWindowMs`，旧配置中的这些字段会被忽略。
+
+验证目标：
+
+- 选中文本后快速按两次 `Cmd+C`，第二次复制后应很快显示 loading 浮窗。
+- 不再需要 `Cmd+Shift+Y` 或辅助功能权限。
+- 翻译完成后剪贴板仍保留用户复制的原文。
+
+### Terminology Output Normalization
+
+规范化浮窗“术语”按钮输出，避免模型返回 Markdown。
+
+主要内容：
+
+- 收紧 `terminology` 模式 prompt，明确禁止 Markdown、标题、加粗、编号、项目符号和表格。
+- 固定术语输出格式为 `英文术语：中文译名。说明：一句话解释。`。
+- 在 DeepSeek adapter 中仅对 `terminology` 模式做本地兜底清洗。
+- 移除常见包装句，如“关键术语解释”“推荐译法”等。
+- 将 `english (中文)：解释` 归一化为纯文本目标格式。
+
+验证目标：
+
+- 点击“术语”按钮后，浮窗不再出现 `**`、Markdown 编号、标题或总结句。
+- 普通翻译模式不做 Markdown 清洗，避免破坏正常译文。

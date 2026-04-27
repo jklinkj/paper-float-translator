@@ -44,4 +44,51 @@ describe("DeepSeekClient", () => {
       })
     ).rejects.toBeInstanceOf(DeepSeekApiError);
   });
+
+  it("normalizes terminology responses before returning them", async () => {
+    const fetchImpl = async (): Promise<Response> => {
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                role: "assistant",
+                content: "**关键术语解释：**\n1. **baseline (基线模型)**：指研究中的参照框架。"
+              }
+            }
+          ]
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    };
+
+    const client = new DeepSeekClient({ apiKey: "test-key", fetchImpl });
+    const result = await client.translate({
+      text: "baseline",
+      model: "deepseek-v4-flash",
+      mode: "terminology"
+    });
+
+    expect(result.translation).toBe("baseline：基线模型。说明：指研究中的参照框架。");
+  });
+
+  it("does not normalize markdown in non-terminology responses", async () => {
+    const fetchImpl = async (): Promise<Response> => {
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { role: "assistant", content: "**译文**" } }]
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    };
+
+    const client = new DeepSeekClient({ apiKey: "test-key", fetchImpl });
+    const result = await client.translate({
+      text: "This is a paper.",
+      model: "deepseek-v4-flash",
+      mode: "academic_zh"
+    });
+
+    expect(result.translation).toBe("**译文**");
+  });
 });

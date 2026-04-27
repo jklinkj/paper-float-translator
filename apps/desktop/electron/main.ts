@@ -1,21 +1,17 @@
-import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { join } from "node:path";
-import { promisify } from "node:util";
 import {
   app,
   BrowserWindow,
   clipboard,
-  globalShortcut,
   ipcMain,
   Menu,
   safeStorage,
   screen,
   shell,
-  systemPreferences,
   type BrowserWindowConstructorOptions,
-  type NativeImage,
   type Point
 } from "electron";
 import {
@@ -24,7 +20,6 @@ import {
   DEFAULT_SETTINGS,
   type AppSettings,
   type PopupState,
-  type TriggerMode,
   type TranslateMode
 } from "@paper-float-translator/core";
 import { DeepSeekClient } from "@paper-float-translator/deepseek";
@@ -36,11 +31,11 @@ import {
   type SecretStore
 } from "@paper-float-translator/storage";
 
-const execFileAsync = promisify(execFile);
 const POPUP_DEFAULT_HEIGHT = 260;
 const POPUP_OFFSET = 18;
-const COPY_TIMEOUT_MS = 1600;
-const COPY_POLL_INTERVAL_MS = 50;
+const DOUBLE_COPY_POLL_INTERVAL_SECONDS = 0.05;
+const DOUBLE_COPY_WINDOW_MS = 900;
+const DOUBLE_COPY_COOLDOWN_MS = 1000;
 const KEYCHAIN_SERVICE = "Paper Float Translator";
 const DEEPSEEK_ACCOUNT = "deepseek-api-key";
 
@@ -59,13 +54,7 @@ let macDoubleCopyWatcher: ChildProcessWithoutNullStreams | null = null;
 let macDoubleCopyStatus = buildInitialDoubleCopyStatus();
 let macDoubleCopyBuffer = "";
 let lastMacCopy: { text: string; copiedAt: number } | null = null;
-
-interface ClipboardSnapshot {
-  text: string;
-  html: string;
-  rtf: string;
-  image?: NativeImage;
-}
+let lastDoubleCopyTrigger: { text: string; triggeredAt: number } | null = null;
 
 interface DoubleCopyStatus {
   available: boolean;
@@ -91,7 +80,7 @@ while true {
     fflush(stdout)
   }
 
-  Thread.sleep(forTimeInterval: 0.25)
+  Thread.sleep(forTimeInterval: ${DOUBLE_COPY_POLL_INTERVAL_SECONDS})
 }
 `;
 
@@ -100,9 +89,9 @@ app.whenReady().then(async () => {
   settings = await settingsStore.load();
   setupApplicationMenu();
   setupIpcHandlers();
-  registerTranslationShortcut();
-  configureMacDoubleCopyWatcher();
+  startMacDoubleCopyWatcher();
   await createSettingsWindow();
+  await prewarmPopupWindow();
 });
 
 app.on("activate", () => {
@@ -110,7 +99,6 @@ app.on("activate", () => {
 });
 
 app.on("will-quit", () => {
-  globalShortcut.unregisterAll();
   stopMacDoubleCopyWatcher();
 });
 
@@ -131,11 +119,6 @@ function setupApplicationMenu(): void {
       {
         label: "Paper Float Translator",
         submenu: [
-          {
-            label: "Translate Selection",
-            click: () => void handleTranslateShortcut()
-          },
-          { type: "separator" },
           {
             label: "Settings",
             accelerator: "CommandOrControl+,",
@@ -169,9 +152,7 @@ function setupIpcHandlers(): void {
 
   ipcMain.handle("settings:save", async (_event, nextSettings: AppSettings) => {
     settings = await settingsStore.save(nextSettings);
-    registerTranslationShortcut();
     resizeExistingPopupToSettings();
-    configureMacDoubleCopyWatcher();
     return settings;
   });
 
@@ -242,77 +223,14 @@ function setupIpcHandlers(): void {
   });
 }
 
-function registerTranslationShortcut(): void {
-  globalShortcut.unregisterAll();
-
-  const registered = globalShortcut.register(settings.shortcut, () => {
-    void handleTranslateShortcut();
-  });
-
-  if (!registered) {
-    console.warn(`Failed to register global shortcut: ${settings.shortcut}`);
-  }
-}
-
-async function handleTranslateShortcut(): Promise<void> {
-  devLog("Translate selection requested.", { triggerMode: settings.triggerMode });
-  lastCursorPoint = screen.getCursorScreenPoint();
-  await showPopup({
-    status: "loading",
-    pinned: currentPopupState.pinned,
-    sourceText: "",
-    cleanedText: "",
-    translation: "",
-    error: "",
-    cached: false
-  });
-
-  try {
-    if (settings.triggerMode === "auto_copy_shortcut") {
-      await translateAutoCopiedSelection();
-      return;
-    }
-
-    await translateClipboardText("shortcut");
-  } catch (error) {
-    updatePopupState({
-      status: "error",
-      pinned: currentPopupState.pinned,
-      error: toUserMessage(error),
-      cleanedText: lastCleanedText
-    });
-  }
-}
-
-async function translateAutoCopiedSelection(): Promise<void> {
-  if (!hasRequiredAccessibilityPermission()) {
-    updatePopupState({
-      status: "error",
-      pinned: currentPopupState.pinned,
-      error: buildAccessibilityPermissionMessage(),
-      sourceText: "",
-      cleanedText: ""
-    });
-    return;
-  }
-
-  const selectedText = await readSelectedTextFromClipboardCopy();
-  await translateRawText(selectedText, "auto_copy_shortcut");
-}
-
-async function translateClipboardText(triggerSource: "shortcut" | "mac_double_copy"): Promise<void> {
-  const clipboardText = readTextFromClipboard();
-  await translateRawText(clipboardText, triggerSource);
-}
-
-async function translateRawText(rawText: string, triggerSource: TriggerMode | "shortcut"): Promise<void> {
+async function translateCopiedText(rawText: string): Promise<void> {
   const cleanedText = cleanSelectedText(rawText, { enabled: settings.cleanPdfText });
 
   if (!cleanedText) {
-    updatePopupState({
+    await showPopup({
       status: "error",
       pinned: currentPopupState.pinned,
-      error: buildEmptyClipboardMessage(triggerSource),
+      error: buildEmptyClipboardMessage(),
       sourceText: rawText,
       cleanedText: ""
     });
@@ -320,11 +238,16 @@ async function translateRawText(rawText: string, triggerSource: TriggerMode | "s
   }
 
   lastCleanedText = cleanedText;
-  await translateText(cleanedText, { bypassCache: false, mode: settings.mode });
-}
-
-function readTextFromClipboard(): string {
-  return clipboard.readText();
+  try {
+    await translateText(cleanedText, { bypassCache: false, mode: settings.mode });
+  } catch (error) {
+    updatePopupState({
+      status: "error",
+      pinned: currentPopupState.pinned,
+      error: toUserMessage(error),
+      cleanedText
+    });
+  }
 }
 
 async function translateText(
@@ -407,60 +330,8 @@ async function translateText(
   });
 }
 
-async function readSelectedTextFromClipboardCopy(): Promise<string> {
-  const snapshot = captureClipboard();
-  const sentinel = createClipboardSentinel();
-
-  try {
-    clipboard.writeText(sentinel);
-    await simulateCopyShortcut();
-    return waitForCopiedText(sentinel);
-  } finally {
-    restoreClipboard(snapshot);
-  }
-}
-
-async function waitForCopiedText(sentinel: string): Promise<string> {
-  const startedAt = Date.now();
-
-  while (Date.now() - startedAt < COPY_TIMEOUT_MS) {
-    const copiedText = clipboard.readText();
-
-    if (copiedText && copiedText !== sentinel) {
-      return copiedText;
-    }
-
-    await delay(COPY_POLL_INTERVAL_MS);
-  }
-
-  const finalText = clipboard.readText();
-  return finalText === sentinel ? "" : finalText;
-}
-
-function createClipboardSentinel(): string {
-  return `__paper_float_translator_copy_${Date.now()}_${Math.random().toString(16).slice(2)}__`;
-}
-
-function buildEmptyClipboardMessage(triggerSource: TriggerMode | "shortcut"): string {
-  if (triggerSource === "auto_copy_shortcut") {
-    return "没有读取到选中文本。自动复制可能被 PDF 阅读器或 macOS 权限拦截，请改用“先复制，再翻译”模式。";
-  }
-
-  if (triggerSource === "mac_double_copy") {
-    return "双复制触发成功，但剪贴板中没有可翻译文本。请确认复制的是文字内容。";
-  }
-
-  return "剪贴板为空或不是文本。请先选中文本并按 Cmd+C 复制，再按翻译快捷键。";
-}
-
-function configureMacDoubleCopyWatcher(): void {
-  if (settings.triggerMode !== "mac_double_copy") {
-    stopMacDoubleCopyWatcher();
-    macDoubleCopyStatus = buildInitialDoubleCopyStatus();
-    return;
-  }
-
-  startMacDoubleCopyWatcher();
+function buildEmptyClipboardMessage(): string {
+  return "剪贴板中没有可翻译文本。请确认复制的是文字内容，然后快速按两次 Cmd+C。";
 }
 
 function startMacDoubleCopyWatcher(): void {
@@ -485,6 +356,7 @@ function startMacDoubleCopyWatcher(): void {
   try {
     macDoubleCopyBuffer = "";
     lastMacCopy = null;
+    lastDoubleCopyTrigger = null;
     macDoubleCopyWatcher = spawn("/usr/bin/swift", ["-e", MAC_PASTEBOARD_WATCHER_SCRIPT], {
       stdio: "pipe"
     }) as ChildProcessWithoutNullStreams;
@@ -520,17 +392,16 @@ function startMacDoubleCopyWatcher(): void {
     });
 
     macDoubleCopyWatcher.on("close", (code) => {
-      if (settings.triggerMode === "mac_double_copy") {
-        macDoubleCopyStatus = {
-          available: false,
-          running: false,
-          message: code === 0 ? "双复制监听已停止。" : "双复制监听已退出，请重启应用或切换取词方式。"
-        };
-      }
+      macDoubleCopyStatus = {
+        available: false,
+        running: false,
+        message: code === 0 ? "双复制监听已停止。" : "双复制监听已退出，请重启应用。"
+      };
 
       macDoubleCopyWatcher = null;
       macDoubleCopyBuffer = "";
       lastMacCopy = null;
+      lastDoubleCopyTrigger = null;
     });
   } catch (error) {
     macDoubleCopyStatus = {
@@ -551,6 +422,7 @@ function stopMacDoubleCopyWatcher(): void {
   watcher.kill();
   macDoubleCopyBuffer = "";
   lastMacCopy = null;
+  lastDoubleCopyTrigger = null;
 }
 
 function handleMacPasteboardChange(line: string): void {
@@ -563,11 +435,6 @@ function handleMacPasteboardChange(line: string): void {
   const text = Buffer.from(encodedText, "base64").toString("utf8");
   const cleaned = cleanSelectedText(text, { enabled: settings.cleanPdfText });
 
-  if (!cleaned) {
-    lastMacCopy = null;
-    return;
-  }
-
   const copiedAt = Date.now();
   const previousCopy = lastMacCopy;
   lastMacCopy = { text: cleaned, copiedAt };
@@ -577,7 +444,7 @@ function handleMacPasteboardChange(line: string): void {
   }
 
   const isRepeatedCopy = previousCopy.text === cleaned;
-  const isWithinWindow = copiedAt - previousCopy.copiedAt <= settings.doubleCopyWindowMs;
+  const isWithinWindow = copiedAt - previousCopy.copiedAt <= DOUBLE_COPY_WINDOW_MS;
 
   if (!isRepeatedCopy || !isWithinWindow) {
     return;
@@ -585,7 +452,32 @@ function handleMacPasteboardChange(line: string): void {
 
   lastMacCopy = null;
   lastCursorPoint = screen.getCursorScreenPoint();
-  void translateRawText(text, "mac_double_copy");
+
+  if (!cleaned) {
+    void showPopup({
+      status: "error",
+      pinned: currentPopupState.pinned,
+      error: buildEmptyClipboardMessage(),
+      sourceText: text,
+      cleanedText: ""
+    });
+    return;
+  }
+
+  if (wasRecentlyTriggered(cleaned, copiedAt)) {
+    return;
+  }
+
+  lastDoubleCopyTrigger = { text: cleaned, triggeredAt: copiedAt };
+  void translateCopiedText(text);
+}
+
+function wasRecentlyTriggered(text: string, copiedAt: number): boolean {
+  return Boolean(
+    lastDoubleCopyTrigger &&
+      lastDoubleCopyTrigger.text === text &&
+      copiedAt - lastDoubleCopyTrigger.triggeredAt <= DOUBLE_COPY_COOLDOWN_MS
+  );
 }
 
 function buildInitialDoubleCopyStatus(): DoubleCopyStatus {
@@ -602,65 +494,6 @@ function buildInitialDoubleCopyStatus(): DoubleCopyStatus {
     running: false,
     message: "双复制监听未启用。"
   };
-}
-
-function captureClipboard(): ClipboardSnapshot {
-  const image = clipboard.readImage();
-
-  return {
-    text: clipboard.readText(),
-    html: clipboard.readHTML(),
-    rtf: clipboard.readRTF(),
-    image: image.isEmpty() ? undefined : image
-  };
-}
-
-function restoreClipboard(snapshot: ClipboardSnapshot): void {
-  const data: Parameters<typeof clipboard.write>[0] = {};
-
-  if (snapshot.text) {
-    data.text = snapshot.text;
-  }
-
-  if (snapshot.html) {
-    data.html = snapshot.html;
-  }
-
-  if (snapshot.rtf) {
-    data.rtf = snapshot.rtf;
-  }
-
-  if (snapshot.image) {
-    data.image = snapshot.image;
-  }
-
-  if (Object.keys(data).length === 0) {
-    clipboard.clear();
-    return;
-  }
-
-  clipboard.write(data);
-}
-
-async function simulateCopyShortcut(): Promise<void> {
-  if (process.platform === "darwin") {
-    await execFileAsync("osascript", [
-      "-e",
-      'tell application "System Events" to keystroke "c" using command down'
-    ]);
-    return;
-  }
-
-  if (process.platform === "win32") {
-    await execFileAsync("powershell.exe", [
-      "-NoProfile",
-      "-Command",
-      "$wshell = New-Object -ComObject WScript.Shell; $wshell.SendKeys('^c')"
-    ]);
-    return;
-  }
-
-  await execFileAsync("xdotool", ["key", "ctrl+c"]);
 }
 
 async function getApiKeySafely(): Promise<string | null> {
@@ -726,6 +559,14 @@ async function ensurePopupWindow(): Promise<BrowserWindow> {
 
   await loadRenderer(popupWindow, "popup");
   return popupWindow;
+}
+
+async function prewarmPopupWindow(): Promise<void> {
+  try {
+    await ensurePopupWindow();
+  } catch (error) {
+    devLog("Popup prewarm failed.", toUserMessage(error));
+  }
 }
 
 async function showPopup(state: PopupState): Promise<void> {
@@ -819,22 +660,8 @@ function secureWebPreferences(): BrowserWindowConstructorOptions["webPreferences
   };
 }
 
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, milliseconds);
-  });
-}
-
 function toUserMessage(error: unknown): string {
   if (error instanceof Error) {
-    if (error.message.includes("osascript")) {
-      return "无法模拟复制。请在系统设置中允许 Paper Float Translator 使用辅助功能权限。";
-    }
-
-    if (error.message.includes("xdotool")) {
-      return "无法模拟复制。Linux 环境需要安装 xdotool，或后续接入平台专用复制实现。";
-    }
-
     return error.message;
   }
 
@@ -852,21 +679,6 @@ function devLog(message: string, metadata?: unknown): void {
   }
 
   console.info(message, metadata);
-}
-
-function hasRequiredAccessibilityPermission(): boolean {
-  if (process.platform !== "darwin") {
-    return true;
-  }
-
-  return systemPreferences.isTrustedAccessibilityClient(false);
-}
-
-function buildAccessibilityPermissionMessage(): string {
-  return [
-    "需要授予 macOS 辅助功能权限后，才能复制其他 App 中的选中文本。",
-    "请打开 System Settings -> Privacy & Security -> Accessibility，允许 Electron、Terminal/Codex 或最终打包后的 Paper Float Translator，然后重启应用。"
-  ].join(" ");
 }
 
 class ResilientSecretStore implements SecretStore {

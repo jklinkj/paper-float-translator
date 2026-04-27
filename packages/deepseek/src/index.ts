@@ -1,4 +1,9 @@
-import { buildSystemPrompt, type TranslateRequest, type TranslateResult } from "@paper-float-translator/core";
+import {
+  buildSystemPrompt,
+  normalizeTerminologyOutput,
+  type TranslateRequest,
+  type TranslateResult
+} from "@paper-float-translator/core";
 
 export const DEEPSEEK_BASE_URL = "https://api.deepseek.com";
 
@@ -86,7 +91,11 @@ export class DeepSeekClient {
     }
 
     const data = (await response.json()) as DeepSeekChatCompletionResponse;
-    const translation = data.choices?.[0]?.message?.content?.trim();
+    const rawTranslation = data.choices?.[0]?.message?.content?.trim();
+    const translation =
+      request.mode === "terminology" && rawTranslation
+        ? normalizeTerminologyOutput(rawTranslation)
+        : rawTranslation;
 
     if (!translation) {
       throw new DeepSeekApiError(response.status, "DeepSeek 响应中没有可用译文。");

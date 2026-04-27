@@ -2,15 +2,15 @@
 
 ## Summary
 
-目标是做一个跨平台桌面端论文划词翻译工具：
+目标是做一个 macOS 优先的桌面端论文划词翻译工具：
 
-选中英文句子或段落，按全局快捷键，程序读取当前选区，调用 DeepSeek 翻译，并在鼠标附近弹出轻量浮窗展示译文。
+选中英文句子或段落，快速按两次 `Cmd+C`，程序读取当前剪贴板，调用 DeepSeek 翻译，并在鼠标附近弹出轻量浮窗展示译文。
 
 第一版采用：
 
 - Electron + Vite + React + TypeScript
 - 桌面 App 优先
-- 快捷键触发，不做桌面端自动监听选区
+- macOS `Cmd+C+C` 双复制触发，不做全局快捷键触发
 - DeepSeek 默认模型：`deepseek-v4-flash`
 - API Key 使用系统钥匙串保存
 - 项目按可扩展架构设计，后续支持浏览器插件、术语表、流式输出和正式分发
@@ -36,7 +36,7 @@ paper-float-translator/
 
 模块职责：
 
-- `apps/desktop`：Electron 桌面端入口，负责窗口、快捷键、剪贴板、IPC、浮窗。
+- `apps/desktop`：Electron 桌面端入口，负责窗口、macOS pasteboard 监听、剪贴板、IPC、浮窗。
 - `packages/core`：平台无关核心逻辑，包括文本清洗、prompt 构造、缓存 key、通用类型。
 - `packages/deepseek`：DeepSeek API adapter。
 - `packages/storage`：设置、缓存、术语表、系统钥匙串封装。
@@ -45,9 +45,9 @@ paper-float-translator/
 进程边界：
 
 - Electron main process：
-  - 注册全局快捷键。
-  - 模拟复制当前选区。
-  - 读取并恢复剪贴板。
+  - 常驻启动 macOS 双复制监听。
+  - 检测快速两次 `Cmd+C`。
+  - 读取剪贴板文本。
   - 调用 DeepSeek API。
   - 管理浮窗位置和生命周期。
   - 访问系统钥匙串。
@@ -63,12 +63,9 @@ paper-float-translator/
 
 第一阶段只做桌面核心闭环：
 
-- 全局快捷键：默认 `CommandOrControl+Shift+Y`
-- 选中文本后按快捷键触发翻译
-- 保存原剪贴板
-- 模拟复制选中文本
-- 读取剪贴板文本
-- 恢复原剪贴板
+- 选中文本后快速按两次 `Cmd+C` 触发翻译
+- App 启动后常驻 macOS pasteboard watcher
+- 读取当前剪贴板文本
 - 清洗 PDF 文本
 - 调 DeepSeek API
 - 鼠标旁展示浮窗
@@ -77,13 +74,14 @@ paper-float-translator/
   - DeepSeek API Key
   - 默认模型
   - 翻译模式
-  - 快捷键
+  - 双复制监听状态
   - PDF 清洗开关
   - 本地缓存开关
 
 第一阶段不做：
 
-- 桌面端自动监听鼠标选区
+- 全局快捷键触发
+- 自动模拟复制选区
 - 浏览器插件
 - 多 provider
 - 云同步
@@ -106,8 +104,8 @@ paper-float-translator/
 实现翻译主链路：
 
 ```text
-global shortcut
-  -> read selected text via clipboard copy
+Cmd+C+C
+  -> detect repeated macOS pasteboard text
   -> clean text
   -> check local cache
   -> call DeepSeek if cache miss
@@ -201,28 +199,15 @@ interface TranslateResult {
 }
 ```
 
-选区读取抽象：
+选区读取策略：
 
-```ts
-interface SelectionProvider {
-  readSelectedText(): Promise<string>;
-}
-```
-
-第一版实现：
-
-```ts
-ClipboardCopySelectionProvider
-```
-
-逻辑：
-
-- 保存当前剪贴板。
-- 模拟 `CommandOrControl+C`。
-- 等待短暂延迟。
-- 读取剪贴板文本。
-- 恢复原剪贴板。
-- 返回文本。
+- 使用 macOS `NSPasteboard.general.changeCount` 监听剪贴板变化。
+- 轮询间隔固定为 `50ms`。
+- 两次复制窗口固定为 `900ms`。
+- 两次复制的清洗后文本必须相同且非空。
+- 命中双复制后立即在鼠标附近显示 loading 浮窗。
+- 触发后对同一文本做短暂去重冷却，避免多连复制重复请求。
+- 翻译完成后剪贴板保留用户复制的原文。
 
 ## DeepSeek Policy
 
@@ -242,6 +227,7 @@ ClipboardCopySelectionProvider
 - 保留公式、变量名、引用编号、专有名词。
 - 必要时在中文译名后保留英文术语。
 - 只输出译文，不输出解释。
+- 术语模式必须输出纯文本列表，格式为 `英文术语：中文译名。说明：一句话解释。`，不使用 Markdown。
 
 ## Text Cleaning
 
@@ -299,7 +285,7 @@ sha256(model + mode + glossaryVersion + cleanedText)
 - API Key 输入和保存
 - 默认模型选择
 - 翻译模式选择
-- 快捷键配置
+- 双复制监听状态
 - PDF 清洗开关
 - 缓存开关
 
@@ -316,9 +302,9 @@ sha256(model + mode + glossaryVersion + cleanedText)
 
 集成测试：
 
-- 快捷键触发
-- 复制选区读取
-- 剪贴板恢复
+- macOS 双复制触发
+- 非 macOS 显示不支持状态
+- 空剪贴板或非文本复制显示错误
 - 空选区不请求 API
 - 缓存命中不请求 API
 - API 失败显示错误
@@ -327,17 +313,17 @@ sha256(model + mode + glossaryVersion + cleanedText)
 
 验收标准：
 
-- 浏览器、PDF 阅读器、Word、Zotero 中选中文本后，按快捷键可以弹出译文。
-- 原剪贴板内容能恢复。
-- 无 API Key、网络失败、权限失败时都有明确提示。
+- 浏览器、PDF 阅读器、Word、Zotero 中选中文本后，快速按两次 `Cmd+C` 可以弹出译文。
+- 翻译完成后剪贴板仍保留用户复制的原文。
+- 无 API Key、网络失败、双复制监听失败时都有明确提示。
 - API Key 不出现在 renderer、日志或仓库。
 - 同一句文本重复翻译能命中缓存。
 - 第一版可在本机开发运行和构建。
 
 ## Assumptions
 
-- 第一版采用跨平台架构，但优先在当前 macOS 环境验证。
-- 快捷键触发是桌面端第一版唯一触发方式。
+- 第一版采用 macOS 优先架构，Windows/Linux 暂时显示双复制不支持。
+- `Cmd+C+C` 是桌面端第一版唯一触发方式。
 - 浏览器插件后置，不阻塞桌面 MVP。
 - 第一版是本机可用版，不做签名、公证、自动更新。
 - DeepSeek 是第一版唯一 provider，但 adapter 保持可扩展。
