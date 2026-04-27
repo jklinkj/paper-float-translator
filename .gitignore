@@ -6,5 +6,6 @@ out
 .env
 .env.*
 !.env.example
+API KEY.md
 coverage
 *.tsbuildinfo

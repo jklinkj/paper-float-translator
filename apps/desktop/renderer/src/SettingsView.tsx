@@ -26,6 +26,7 @@ const MODE_OPTIONS: Array<{ value: TranslateMode; label: string }> = [
 
 export function SettingsView(): JSX.Element {
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
+  const [popupWidthInput, setPopupWidthInput] = useState(String(DEFAULT_SETTINGS.popupWidth));
   const [apiKey, setApiKey] = useState("");
   const [hasApiKey, setHasApiKey] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -44,6 +45,7 @@ export function SettingsView(): JSX.Element {
         }
 
         setSettings(payload.settings);
+        setPopupWidthInput(String(payload.settings.popupWidth));
         setHasApiKey(payload.hasApiKey);
       })
       .catch((loadError: unknown) => {
@@ -65,13 +67,25 @@ export function SettingsView(): JSX.Element {
   }, [settings.shortcut]);
 
   async function handleSave(): Promise<void> {
+    const popupWidth = parsePopupWidthInput(popupWidthInput);
+
+    if (popupWidth === null) {
+      setNotice(null);
+      setError("浮窗宽度请输入 320 到 640 之间的数字。");
+      return;
+    }
+
     setSaving(true);
     setNotice(null);
     setError(null);
 
     try {
-      const savedSettings = await window.paperFloatTranslator.saveSettings(settings);
+      const savedSettings = await window.paperFloatTranslator.saveSettings({
+        ...settings,
+        popupWidth
+      });
       setSettings(savedSettings);
+      setPopupWidthInput(String(savedSettings.popupWidth));
 
       if (apiKey.trim()) {
         const result = await window.paperFloatTranslator.saveApiKey(apiKey);
@@ -211,9 +225,11 @@ export function SettingsView(): JSX.Element {
               type="number"
               min={320}
               max={640}
-              value={settings.popupWidth}
-              onChange={(event) => setSettings({ ...settings, popupWidth: Number(event.target.value) })}
+              step={20}
+              value={popupWidthInput}
+              onChange={(event) => setPopupWidthInput(event.target.value)}
             />
+            <small>范围 320-640，保存时生效。</small>
           </label>
 
           <label className="switch-row">
@@ -269,4 +285,18 @@ export function SettingsView(): JSX.Element {
       </footer>
     </main>
   );
+}
+
+function parsePopupWidthInput(value: string): number | null {
+  if (!value.trim()) {
+    return null;
+  }
+
+  const parsed = Number(value);
+
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+
+  return Math.round(parsed);
 }

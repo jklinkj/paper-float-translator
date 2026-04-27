@@ -38,6 +38,8 @@ import {
 const execFileAsync = promisify(execFile);
 const POPUP_DEFAULT_HEIGHT = 260;
 const POPUP_OFFSET = 18;
+const COPY_TIMEOUT_MS = 1600;
+const COPY_POLL_INTERVAL_MS = 50;
 const KEYCHAIN_SERVICE = "Paper Float Translator";
 const DEEPSEEK_ACCOUNT = "deepseek-api-key";
 
@@ -132,6 +134,7 @@ function setupIpcHandlers(): void {
   ipcMain.handle("settings:save", async (_event, nextSettings: AppSettings) => {
     settings = await settingsStore.save(nextSettings);
     registerTranslationShortcut();
+    resizeExistingPopupToSettings();
     return settings;
   });
 
@@ -347,15 +350,36 @@ async function translateText(
 
 async function readSelectedTextFromClipboardCopy(): Promise<string> {
   const snapshot = captureClipboard();
+  const sentinel = createClipboardSentinel();
 
   try {
-    clipboard.clear();
+    clipboard.writeText(sentinel);
     await simulateCopyShortcut();
-    await delay(140);
-    return clipboard.readText();
+    return waitForCopiedText(sentinel);
   } finally {
     restoreClipboard(snapshot);
   }
+}
+
+async function waitForCopiedText(sentinel: string): Promise<string> {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < COPY_TIMEOUT_MS) {
+    const copiedText = clipboard.readText();
+
+    if (copiedText && copiedText !== sentinel) {
+      return copiedText;
+    }
+
+    await delay(COPY_POLL_INTERVAL_MS);
+  }
+
+  const finalText = clipboard.readText();
+  return finalText === sentinel ? "" : finalText;
+}
+
+function createClipboardSentinel(): string {
+  return `__paper_float_translator_copy_${Date.now()}_${Math.random().toString(16).slice(2)}__`;
 }
 
 function captureClipboard(): ClipboardSnapshot {
@@ -485,12 +509,26 @@ async function ensurePopupWindow(): Promise<BrowserWindow> {
 async function showPopup(state: PopupState): Promise<void> {
   updatePopupState(state);
   const popup = await ensurePopupWindow();
+  resizeExistingPopupToSettings();
   const [width, height] = popup.getSize();
   positionPopup(lastCursorPoint ?? screen.getCursorScreenPoint(), width, height);
   popup.showInactive();
   popup.moveTop();
   devLog("Popup shown.", { visible: popup.isVisible(), bounds: popup.getBounds() });
   sendPopupState();
+}
+
+function resizeExistingPopupToSettings(): void {
+  if (!popupWindow || popupWindow.isDestroyed()) {
+    return;
+  }
+
+  const [, currentHeight] = popupWindow.getSize();
+  popupWindow.setSize(settings.popupWidth, currentHeight, false);
+
+  if (lastCursorPoint) {
+    positionPopup(lastCursorPoint, settings.popupWidth, currentHeight);
+  }
 }
 
 function updatePopupState(state: PopupState): void {

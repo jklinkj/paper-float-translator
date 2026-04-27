@@ -33,6 +33,13 @@ describe("JsonSettingsStore", () => {
     expect(settings.model).toBe("deepseek-v4-pro");
     expect(settings.popupWidth).toBe(640);
   });
+
+  it("accepts popup width values that arrive as numeric strings", async () => {
+    const store = new JsonSettingsStore(join(dir, "settings.json"));
+    const settings = await store.update({ popupWidth: "520" as unknown as number });
+
+    expect(settings.popupWidth).toBe(520);
+  });
 });
 
 describe("JsonCacheStore", () => {

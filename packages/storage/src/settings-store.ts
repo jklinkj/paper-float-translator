@@ -41,11 +41,13 @@ export function normalizeSettings(raw: Partial<AppSettings>): AppSettings {
 }
 
 function normalizePopupWidth(value: unknown): number {
-  if (typeof value !== "number" || Number.isNaN(value)) {
+  const numericValue = typeof value === "string" && value.trim() ? Number(value) : value;
+
+  if (typeof numericValue !== "number" || Number.isNaN(numericValue)) {
     return DEFAULT_SETTINGS.popupWidth;
   }
 
-  return Math.min(640, Math.max(320, Math.round(value)));
+  return Math.min(640, Math.max(320, Math.round(numericValue)));
 }
 
 function isDeepSeekModel(value: unknown): value is DeepSeekModel {

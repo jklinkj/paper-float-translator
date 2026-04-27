@@ -126,9 +126,15 @@ button:disabled {
 }
 
 .field span,
+.field small,
 .switch-row span {
   color: #43505d;
   font-size: 13px;
+}
+
+.field small {
+  color: #788592;
+  line-height: 1.35;
 }
 
 .field input,
