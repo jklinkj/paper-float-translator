@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { join } from "node:path";
@@ -24,6 +24,7 @@ import {
   DEFAULT_SETTINGS,
   type AppSettings,
   type PopupState,
+  type TriggerMode,
   type TranslateMode
 } from "@paper-float-translator/core";
 import { DeepSeekClient } from "@paper-float-translator/deepseek";
@@ -54,6 +55,10 @@ let popupWindow: BrowserWindow | null = null;
 let currentPopupState: PopupState = { status: "idle", pinned: false };
 let lastCursorPoint: Point | null = null;
 let lastCleanedText = "";
+let macDoubleCopyWatcher: ChildProcessWithoutNullStreams | null = null;
+let macDoubleCopyStatus = buildInitialDoubleCopyStatus();
+let macDoubleCopyBuffer = "";
+let lastMacCopy: { text: string; copiedAt: number } | null = null;
 
 interface ClipboardSnapshot {
   text: string;
@@ -62,12 +67,41 @@ interface ClipboardSnapshot {
   image?: NativeImage;
 }
 
+interface DoubleCopyStatus {
+  available: boolean;
+  running: boolean;
+  message: string;
+}
+
+const MAC_PASTEBOARD_WATCHER_SCRIPT = `
+import AppKit
+import Foundation
+
+var lastChangeCount = NSPasteboard.general.changeCount
+
+while true {
+  let pasteboard = NSPasteboard.general
+  let changeCount = pasteboard.changeCount
+
+  if changeCount != lastChangeCount {
+    lastChangeCount = changeCount
+    let text = pasteboard.string(forType: .string) ?? ""
+    let encoded = text.data(using: .utf8)?.base64EncodedString() ?? ""
+    print("\\(changeCount)\\t\\(encoded)")
+    fflush(stdout)
+  }
+
+  Thread.sleep(forTimeInterval: 0.25)
+}
+`;
+
 app.whenReady().then(async () => {
   createStores();
   settings = await settingsStore.load();
   setupApplicationMenu();
   setupIpcHandlers();
   registerTranslationShortcut();
+  configureMacDoubleCopyWatcher();
   await createSettingsWindow();
 });
 
@@ -77,6 +111,7 @@ app.on("activate", () => {
 
 app.on("will-quit", () => {
   globalShortcut.unregisterAll();
+  stopMacDoubleCopyWatcher();
 });
 
 function createStores(): void {
@@ -127,7 +162,8 @@ function setupIpcHandlers(): void {
     settings = await settingsStore.load();
     return {
       settings,
-      hasApiKey: Boolean(await getApiKeySafely())
+      hasApiKey: Boolean(await getApiKeySafely()),
+      doubleCopyStatus: macDoubleCopyStatus
     };
   });
 
@@ -135,6 +171,7 @@ function setupIpcHandlers(): void {
     settings = await settingsStore.save(nextSettings);
     registerTranslationShortcut();
     resizeExistingPopupToSettings();
+    configureMacDoubleCopyWatcher();
     return settings;
   });
 
@@ -218,7 +255,7 @@ function registerTranslationShortcut(): void {
 }
 
 async function handleTranslateShortcut(): Promise<void> {
-  devLog("Translate selection requested.");
+  devLog("Translate selection requested.", { triggerMode: settings.triggerMode });
   lastCursorPoint = screen.getCursorScreenPoint();
   await showPopup({
     status: "loading",
@@ -231,33 +268,12 @@ async function handleTranslateShortcut(): Promise<void> {
   });
 
   try {
-    if (!hasRequiredAccessibilityPermission()) {
-      updatePopupState({
-        status: "error",
-        pinned: currentPopupState.pinned,
-        error: buildAccessibilityPermissionMessage(),
-        sourceText: "",
-        cleanedText: ""
-      });
+    if (settings.triggerMode === "auto_copy_shortcut") {
+      await translateAutoCopiedSelection();
       return;
     }
 
-    const selectedText = await readSelectedTextFromClipboardCopy();
-    const cleanedText = cleanSelectedText(selectedText, { enabled: settings.cleanPdfText });
-
-    if (!cleanedText) {
-      updatePopupState({
-        status: "error",
-        pinned: currentPopupState.pinned,
-        error: "没有读取到选中文本。请先选中英文句子或段落，再按快捷键。",
-        sourceText: selectedText,
-        cleanedText: ""
-      });
-      return;
-    }
-
-    lastCleanedText = cleanedText;
-    await translateText(cleanedText, { bypassCache: false, mode: settings.mode });
+    await translateClipboardText("shortcut");
   } catch (error) {
     updatePopupState({
       status: "error",
@@ -266,6 +282,49 @@ async function handleTranslateShortcut(): Promise<void> {
       cleanedText: lastCleanedText
     });
   }
+}
+
+async function translateAutoCopiedSelection(): Promise<void> {
+  if (!hasRequiredAccessibilityPermission()) {
+    updatePopupState({
+      status: "error",
+      pinned: currentPopupState.pinned,
+      error: buildAccessibilityPermissionMessage(),
+      sourceText: "",
+      cleanedText: ""
+    });
+    return;
+  }
+
+  const selectedText = await readSelectedTextFromClipboardCopy();
+  await translateRawText(selectedText, "auto_copy_shortcut");
+}
+
+async function translateClipboardText(triggerSource: "shortcut" | "mac_double_copy"): Promise<void> {
+  const clipboardText = readTextFromClipboard();
+  await translateRawText(clipboardText, triggerSource);
+}
+
+async function translateRawText(rawText: string, triggerSource: TriggerMode | "shortcut"): Promise<void> {
+  const cleanedText = cleanSelectedText(rawText, { enabled: settings.cleanPdfText });
+
+  if (!cleanedText) {
+    updatePopupState({
+      status: "error",
+      pinned: currentPopupState.pinned,
+      error: buildEmptyClipboardMessage(triggerSource),
+      sourceText: rawText,
+      cleanedText: ""
+    });
+    return;
+  }
+
+  lastCleanedText = cleanedText;
+  await translateText(cleanedText, { bypassCache: false, mode: settings.mode });
+}
+
+function readTextFromClipboard(): string {
+  return clipboard.readText();
 }
 
 async function translateText(
@@ -380,6 +439,169 @@ async function waitForCopiedText(sentinel: string): Promise<string> {
 
 function createClipboardSentinel(): string {
   return `__paper_float_translator_copy_${Date.now()}_${Math.random().toString(16).slice(2)}__`;
+}
+
+function buildEmptyClipboardMessage(triggerSource: TriggerMode | "shortcut"): string {
+  if (triggerSource === "auto_copy_shortcut") {
+    return "没有读取到选中文本。自动复制可能被 PDF 阅读器或 macOS 权限拦截，请改用“先复制，再翻译”模式。";
+  }
+
+  if (triggerSource === "mac_double_copy") {
+    return "双复制触发成功，但剪贴板中没有可翻译文本。请确认复制的是文字内容。";
+  }
+
+  return "剪贴板为空或不是文本。请先选中文本并按 Cmd+C 复制，再按翻译快捷键。";
+}
+
+function configureMacDoubleCopyWatcher(): void {
+  if (settings.triggerMode !== "mac_double_copy") {
+    stopMacDoubleCopyWatcher();
+    macDoubleCopyStatus = buildInitialDoubleCopyStatus();
+    return;
+  }
+
+  startMacDoubleCopyWatcher();
+}
+
+function startMacDoubleCopyWatcher(): void {
+  if (process.platform !== "darwin") {
+    macDoubleCopyStatus = {
+      available: false,
+      running: false,
+      message: "双复制触发目前仅支持 macOS。"
+    };
+    return;
+  }
+
+  if (macDoubleCopyWatcher) {
+    macDoubleCopyStatus = {
+      available: true,
+      running: true,
+      message: "双复制监听已启用。"
+    };
+    return;
+  }
+
+  try {
+    macDoubleCopyBuffer = "";
+    lastMacCopy = null;
+    macDoubleCopyWatcher = spawn("/usr/bin/swift", ["-e", MAC_PASTEBOARD_WATCHER_SCRIPT], {
+      stdio: "pipe"
+    }) as ChildProcessWithoutNullStreams;
+    macDoubleCopyStatus = {
+      available: true,
+      running: true,
+      message: "双复制监听已启用。"
+    };
+
+    macDoubleCopyWatcher.stdout.setEncoding("utf8");
+    macDoubleCopyWatcher.stdout.on("data", (chunk: string) => {
+      macDoubleCopyBuffer += chunk;
+      const lines = macDoubleCopyBuffer.split(/\r?\n/);
+      macDoubleCopyBuffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        handleMacPasteboardChange(line);
+      }
+    });
+
+    macDoubleCopyWatcher.stderr.setEncoding("utf8");
+    macDoubleCopyWatcher.stderr.on("data", (chunk: string) => {
+      devLog("macOS double-copy watcher stderr.", chunk.slice(0, 240));
+    });
+
+    macDoubleCopyWatcher.on("error", (error) => {
+      macDoubleCopyStatus = {
+        available: false,
+        running: false,
+        message: `双复制监听启动失败：${error.message}`
+      };
+      macDoubleCopyWatcher = null;
+    });
+
+    macDoubleCopyWatcher.on("close", (code) => {
+      if (settings.triggerMode === "mac_double_copy") {
+        macDoubleCopyStatus = {
+          available: false,
+          running: false,
+          message: code === 0 ? "双复制监听已停止。" : "双复制监听已退出，请重启应用或切换取词方式。"
+        };
+      }
+
+      macDoubleCopyWatcher = null;
+      macDoubleCopyBuffer = "";
+      lastMacCopy = null;
+    });
+  } catch (error) {
+    macDoubleCopyStatus = {
+      available: false,
+      running: false,
+      message: error instanceof Error ? `双复制监听启动失败：${error.message}` : "双复制监听启动失败。"
+    };
+  }
+}
+
+function stopMacDoubleCopyWatcher(): void {
+  if (!macDoubleCopyWatcher) {
+    return;
+  }
+
+  const watcher = macDoubleCopyWatcher;
+  macDoubleCopyWatcher = null;
+  watcher.kill();
+  macDoubleCopyBuffer = "";
+  lastMacCopy = null;
+}
+
+function handleMacPasteboardChange(line: string): void {
+  const [, encodedText] = line.split("\t");
+
+  if (encodedText === undefined) {
+    return;
+  }
+
+  const text = Buffer.from(encodedText, "base64").toString("utf8");
+  const cleaned = cleanSelectedText(text, { enabled: settings.cleanPdfText });
+
+  if (!cleaned) {
+    lastMacCopy = null;
+    return;
+  }
+
+  const copiedAt = Date.now();
+  const previousCopy = lastMacCopy;
+  lastMacCopy = { text: cleaned, copiedAt };
+
+  if (!previousCopy) {
+    return;
+  }
+
+  const isRepeatedCopy = previousCopy.text === cleaned;
+  const isWithinWindow = copiedAt - previousCopy.copiedAt <= settings.doubleCopyWindowMs;
+
+  if (!isRepeatedCopy || !isWithinWindow) {
+    return;
+  }
+
+  lastMacCopy = null;
+  lastCursorPoint = screen.getCursorScreenPoint();
+  void translateRawText(text, "mac_double_copy");
+}
+
+function buildInitialDoubleCopyStatus(): DoubleCopyStatus {
+  if (process.platform !== "darwin") {
+    return {
+      available: false,
+      running: false,
+      message: "双复制触发目前仅支持 macOS。"
+    };
+  }
+
+  return {
+    available: true,
+    running: false,
+    message: "双复制监听未启用。"
+  };
 }
 
 function captureClipboard(): ClipboardSnapshot {

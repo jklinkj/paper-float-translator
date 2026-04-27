@@ -9,7 +9,13 @@ import {
   Save,
   Settings
 } from "lucide-react";
-import { DEFAULT_SETTINGS, type AppSettings, type DeepSeekModel, type TranslateMode } from "@paper-float-translator/core";
+import {
+  DEFAULT_SETTINGS,
+  type AppSettings,
+  type DeepSeekModel,
+  type TranslateMode,
+  type TriggerMode
+} from "@paper-float-translator/core";
 
 const MODEL_OPTIONS: Array<{ value: DeepSeekModel; label: string }> = [
   { value: "deepseek-v4-flash", label: "DeepSeek V4 Flash" },
@@ -24,11 +30,19 @@ const MODE_OPTIONS: Array<{ value: TranslateMode; label: string }> = [
   { value: "terminology", label: "解释术语" }
 ];
 
+const TRIGGER_MODE_OPTIONS: Array<{ value: TriggerMode; label: string }> = [
+  { value: "clipboard_shortcut", label: "先复制，再翻译" },
+  { value: "auto_copy_shortcut", label: "自动复制选区" },
+  { value: "mac_double_copy", label: "Cmd+C+C 实验" }
+];
+
 export function SettingsView(): JSX.Element {
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [popupWidthInput, setPopupWidthInput] = useState(String(DEFAULT_SETTINGS.popupWidth));
+  const [doubleCopyWindowInput, setDoubleCopyWindowInput] = useState(String(DEFAULT_SETTINGS.doubleCopyWindowMs));
   const [apiKey, setApiKey] = useState("");
   const [hasApiKey, setHasApiKey] = useState(false);
+  const [doubleCopyStatus, setDoubleCopyStatus] = useState({ available: true, running: false, message: "" });
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -46,7 +60,9 @@ export function SettingsView(): JSX.Element {
 
         setSettings(payload.settings);
         setPopupWidthInput(String(payload.settings.popupWidth));
+        setDoubleCopyWindowInput(String(payload.settings.doubleCopyWindowMs));
         setHasApiKey(payload.hasApiKey);
+        setDoubleCopyStatus(payload.doubleCopyStatus);
       })
       .catch((loadError: unknown) => {
         setError(loadError instanceof Error ? loadError.message : "读取设置失败。");
@@ -66,12 +82,31 @@ export function SettingsView(): JSX.Element {
     return settings.shortcut.replace("CommandOrControl", "Cmd/Ctrl");
   }, [settings.shortcut]);
 
+  const workflowHint = useMemo(() => {
+    if (settings.triggerMode === "auto_copy_shortcut") {
+      return `选中文本后按 ${shortcutHint}，程序会尝试自动复制并翻译。`;
+    }
+
+    if (settings.triggerMode === "mac_double_copy") {
+      return "选中文本后快速按两次 Cmd+C，自动在鼠标附近显示翻译浮窗。";
+    }
+
+    return `先按 Cmd+C 复制文本，再按 ${shortcutHint} 翻译当前剪贴板文本。`;
+  }, [settings.triggerMode, shortcutHint]);
+
   async function handleSave(): Promise<void> {
     const popupWidth = parsePopupWidthInput(popupWidthInput);
+    const doubleCopyWindowMs = parseDoubleCopyWindowInput(doubleCopyWindowInput);
 
     if (popupWidth === null) {
       setNotice(null);
       setError("浮窗宽度请输入 320 到 640 之间的数字。");
+      return;
+    }
+
+    if (doubleCopyWindowMs === null) {
+      setNotice(null);
+      setError("双复制窗口请输入 400 到 3000 之间的毫秒数。");
       return;
     }
 
@@ -82,10 +117,12 @@ export function SettingsView(): JSX.Element {
     try {
       const savedSettings = await window.paperFloatTranslator.saveSettings({
         ...settings,
-        popupWidth
+        popupWidth,
+        doubleCopyWindowMs
       });
       setSettings(savedSettings);
       setPopupWidthInput(String(savedSettings.popupWidth));
+      setDoubleCopyWindowInput(String(savedSettings.doubleCopyWindowMs));
 
       if (apiKey.trim()) {
         const result = await window.paperFloatTranslator.saveApiKey(apiKey);
@@ -93,6 +130,9 @@ export function SettingsView(): JSX.Element {
         setApiKey("");
       }
 
+      const refreshed = await window.paperFloatTranslator.getSettings();
+      setHasApiKey(refreshed.hasApiKey);
+      setDoubleCopyStatus(refreshed.doubleCopyStatus);
       setNotice("设置已保存。");
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : "保存设置失败。");
@@ -147,7 +187,7 @@ export function SettingsView(): JSX.Element {
       <header className="settings-header">
         <div>
           <h1>Paper Float Translator</h1>
-          <p>选中文本后按 {shortcutHint}，在鼠标附近显示论文翻译浮窗。</p>
+          <p>{workflowHint}</p>
         </div>
         <button
           className="icon-link"
@@ -210,6 +250,44 @@ export function SettingsView(): JSX.Element {
             <Settings size={18} />
             <h2>桌面行为</h2>
           </div>
+
+          <label className="field">
+            <span>取词方式</span>
+            <select
+              value={settings.triggerMode}
+              onChange={(event) => setSettings({ ...settings, triggerMode: event.target.value as TriggerMode })}
+            >
+              {TRIGGER_MODE_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            {settings.triggerMode === "clipboard_shortcut" ? (
+              <small>推荐：PDF 里先手动复制，避免读到旧剪贴板。</small>
+            ) : null}
+            {settings.triggerMode === "auto_copy_shortcut" ? (
+              <small>备用：需要 macOS 辅助功能权限，部分 PDF 阅读器可能不稳定。</small>
+            ) : null}
+            {settings.triggerMode === "mac_double_copy" ? (
+              <small>{doubleCopyStatus.message || "macOS 实验功能：快速复制同一段文字两次后触发。"}</small>
+            ) : null}
+          </label>
+
+          {settings.triggerMode === "mac_double_copy" ? (
+            <label className="field">
+              <span>双复制触发窗口</span>
+              <input
+                type="number"
+                min={400}
+                max={3000}
+                step={100}
+                value={doubleCopyWindowInput}
+                onChange={(event) => setDoubleCopyWindowInput(event.target.value)}
+              />
+              <small>范围 400-3000ms，默认 1200ms。</small>
+            </label>
+          ) : null}
 
           <label className="field">
             <span>全局快捷键</span>
@@ -295,6 +373,20 @@ function parsePopupWidthInput(value: string): number | null {
   const parsed = Number(value);
 
   if (!Number.isFinite(parsed)) {
+    return null;
+  }
+
+  return Math.round(parsed);
+}
+
+function parseDoubleCopyWindowInput(value: string): number | null {
+  if (!value.trim()) {
+    return null;
+  }
+
+  const parsed = Number(value);
+
+  if (!Number.isFinite(parsed) || parsed < 400 || parsed > 3000) {
     return null;
   }
 

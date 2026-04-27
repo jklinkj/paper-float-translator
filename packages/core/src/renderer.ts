@@ -9,6 +9,7 @@ export type {
   Glossary,
   PopupState,
   PopupStatus,
+  TriggerMode,
   TranslateMode,
   TranslateRequest,
   TranslateResult

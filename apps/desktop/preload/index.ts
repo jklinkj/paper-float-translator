@@ -4,6 +4,11 @@ import type { AppSettings, PopupState } from "@paper-float-translator/core";
 export interface SettingsPayload {
   settings: AppSettings;
   hasApiKey: boolean;
+  doubleCopyStatus: {
+    available: boolean;
+    running: boolean;
+    message: string;
+  };
 }
 
 export const api = {

@@ -5,6 +5,11 @@ import type { AppSettings, PopupState } from "@paper-float-translator/core";
 interface SettingsPayload {
   settings: AppSettings;
   hasApiKey: boolean;
+  doubleCopyStatus: {
+    available: boolean;
+    running: boolean;
+    message: string;
+  };
 }
 
 interface PaperFloatTranslatorApi {

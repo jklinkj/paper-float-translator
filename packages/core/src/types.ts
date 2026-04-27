@@ -12,6 +12,11 @@ export type TranslateMode =
   | "natural"
   | "terminology";
 
+export type TriggerMode =
+  | "clipboard_shortcut"
+  | "auto_copy_shortcut"
+  | "mac_double_copy";
+
 export type Glossary = Record<string, string>;
 
 export interface TranslateRequest {
@@ -35,6 +40,8 @@ export interface AppSettings {
   shortcut: string;
   model: DeepSeekModel;
   mode: TranslateMode;
+  triggerMode: TriggerMode;
+  doubleCopyWindowMs: number;
   cleanPdfText: boolean;
   enableCache: boolean;
   popupWidth: number;
@@ -44,6 +51,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   shortcut: "CommandOrControl+Shift+Y",
   model: DEFAULT_DEEPSEEK_MODEL,
   mode: "academic_zh",
+  triggerMode: "clipboard_shortcut",
+  doubleCopyWindowMs: 1200,
   cleanPdfText: true,
   enableCache: true,
   popupWidth: 420

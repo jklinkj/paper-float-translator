@@ -22,8 +22,25 @@ describe("JsonSettingsStore", () => {
     await expect(store.load()).resolves.toMatchObject({
       shortcut: "CommandOrControl+Shift+Y",
       model: "deepseek-v4-flash",
+      triggerMode: "clipboard_shortcut",
+      doubleCopyWindowMs: 1200,
       cleanPdfText: true
     });
+  });
+
+  it("fills trigger mode defaults for old settings files", async () => {
+    const store = new JsonSettingsStore(join(dir, "settings.json"));
+    const settings = await store.save({
+      shortcut: "CommandOrControl+Shift+Y",
+      model: "deepseek-v4-flash",
+      mode: "academic_zh",
+      cleanPdfText: true,
+      enableCache: true,
+      popupWidth: 420
+    } as unknown as Awaited<ReturnType<JsonSettingsStore["load"]>>);
+
+    expect(settings.triggerMode).toBe("clipboard_shortcut");
+    expect(settings.doubleCopyWindowMs).toBe(1200);
   });
 
   it("saves normalized settings", async () => {
@@ -39,6 +56,17 @@ describe("JsonSettingsStore", () => {
     const settings = await store.update({ popupWidth: "520" as unknown as number });
 
     expect(settings.popupWidth).toBe(520);
+  });
+
+  it("normalizes double copy window values", async () => {
+    const store = new JsonSettingsStore(join(dir, "settings.json"));
+    const settings = await store.update({
+      triggerMode: "mac_double_copy",
+      doubleCopyWindowMs: "1800" as unknown as number
+    });
+
+    expect(settings.triggerMode).toBe("mac_double_copy");
+    expect(settings.doubleCopyWindowMs).toBe(1800);
   });
 });
 
