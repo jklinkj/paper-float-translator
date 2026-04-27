@@ -1,5 +1,6 @@
 import {
   DEFAULT_SETTINGS,
+  normalizeTargetLanguage,
   type AppSettings,
   type DeepSeekModel,
   type TranslateMode
@@ -35,6 +36,11 @@ export function normalizeSettings(raw: Partial<AppSettings>): AppSettings {
     mode: isTranslateMode(raw.mode) ? raw.mode : DEFAULT_SETTINGS.mode,
     cleanPdfText: typeof raw.cleanPdfText === "boolean" ? raw.cleanPdfText : DEFAULT_SETTINGS.cleanPdfText,
     enableCache: typeof raw.enableCache === "boolean" ? raw.enableCache : DEFAULT_SETTINGS.enableCache,
+    enableSelectionPopup:
+      typeof raw.enableSelectionPopup === "boolean"
+        ? raw.enableSelectionPopup
+        : DEFAULT_SETTINGS.enableSelectionPopup,
+    targetLanguage: normalizeTargetLanguage(raw.targetLanguage, DEFAULT_SETTINGS.targetLanguage),
     popupWidth: normalizePopupWidth(raw.popupWidth)
   };
 }

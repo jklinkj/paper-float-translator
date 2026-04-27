@@ -4,13 +4,13 @@
 
 目标是做一个 macOS 优先的桌面端论文划词翻译工具：
 
-选中英文句子或段落，快速按两次 `Cmd+C`，程序读取当前剪贴板，调用 DeepSeek 翻译，并在鼠标附近弹出轻量浮窗展示译文。
+选中英文句子或段落后，程序尝试通过 macOS Accessibility 读取当前选区，并在鼠标附近弹出轻量操作浮窗；点击“翻译”后调用 DeepSeek 展示译文。若当前应用不支持自动选区读取，仍可快速按两次 `Cmd+C` 触发兜底翻译。
 
 第一版采用：
 
 - Electron + Vite + React + TypeScript
 - 桌面 App 优先
-- macOS `Cmd+C+C` 双复制触发，不做全局快捷键触发
+- macOS 自动选区操作浮窗优先，`Cmd+C+C` 双复制作为兜底
 - DeepSeek 默认模型：`deepseek-v4-flash`
 - API Key 使用系统钥匙串保存
 - 项目按可扩展架构设计，后续支持浏览器插件、术语表、流式输出和正式分发
@@ -36,7 +36,7 @@ paper-float-translator/
 
 模块职责：
 
-- `apps/desktop`：Electron 桌面端入口，负责窗口、macOS pasteboard 监听、剪贴板、IPC、浮窗。
+- `apps/desktop`：Electron 桌面端入口，负责窗口、macOS 选区监听、macOS pasteboard 监听、剪贴板、IPC、浮窗。
 - `packages/core`：平台无关核心逻辑，包括文本清洗、prompt 构造、缓存 key、通用类型。
 - `packages/deepseek`：DeepSeek API adapter。
 - `packages/storage`：设置、缓存、术语表、系统钥匙串封装。
@@ -45,8 +45,10 @@ paper-float-translator/
 进程边界：
 
 - Electron main process：
-  - 常驻启动 macOS 双复制监听。
-  - 检测快速两次 `Cmd+C`。
+  - 常驻启动 macOS 自动选区监听。
+  - 常驻启动 macOS 双复制兜底监听。
+  - 通过 Accessibility 尝试读取当前前台应用选区。
+  - 检测快速两次 `Cmd+C` 作为兜底。
   - 读取剪贴板文本。
   - 调用 DeepSeek API。
   - 管理浮窗位置和生命周期。
@@ -63,7 +65,10 @@ paper-float-translator/
 
 第一阶段只做桌面核心闭环：
 
-- 选中文本后快速按两次 `Cmd+C` 触发翻译
+- 选中文本后自动显示操作浮窗
+- 操作浮窗支持复制、翻译、关闭
+- 不支持自动选区读取时，快速按两次 `Cmd+C` 触发兜底翻译
+- App 启动后常驻 macOS selection watcher
 - App 启动后常驻 macOS pasteboard watcher
 - 读取当前剪贴板文本
 - 清洗 PDF 文本
@@ -74,7 +79,10 @@ paper-float-translator/
   - DeepSeek API Key
   - 默认模型
   - 翻译模式
-  - 双复制监听状态
+  - 默认目标语言
+  - 拖选后显示操作浮窗开关
+  - 自动选区监听状态
+  - 双复制兜底监听状态
   - PDF 清洗开关
   - 本地缓存开关
 
@@ -104,8 +112,11 @@ paper-float-translator/
 实现翻译主链路：
 
 ```text
-Cmd+C+C
-  -> detect repeated macOS pasteboard text
+mouse selection
+  -> detect macOS mouse selection end
+  -> read selected text via Accessibility
+  -> show action popup near cursor
+  -> user clicks translate
   -> clean text
   -> check local cache
   -> call DeepSeek if cache miss
@@ -133,10 +144,10 @@ Cmd+C+C
 - DeepSeek streaming 输出
 - 缓存管理 UI
 
-术语表参与缓存 key：
+术语表和目标语言参与缓存 key：
 
 ```text
-sha256(model + mode + glossaryVersion + cleanedText)
+sha256(model + mode + targetLanguage + glossaryVersion + cleanedText)
 ```
 
 ### Phase 3: Browser Extension
@@ -185,6 +196,7 @@ interface TranslateRequest {
   text: string;
   model: DeepSeekModel;
   mode: TranslateMode;
+  targetLanguage: string;
   glossary?: Record<string, string>;
 }
 ```
@@ -201,6 +213,15 @@ interface TranslateResult {
 
 选区读取策略：
 
+- 主路径使用 macOS Accessibility API 读取当前 focused UI element 的选中文本。
+- 使用 macOS `CGEventTap` 监听鼠标按下、拖动和松开。
+- 鼠标左键拖选松开后，延迟约 `100ms` 读取选区，避免读取到拖选中间态。
+- 读取候选包括鼠标下元素、父链、focused element、focused window 和有限子树搜索。
+- 不做选区轮询触发，避免拖选过程中提前弹出浮窗。
+- 读取成功后只显示操作浮窗，不立即调用 DeepSeek。
+- 自动选区操作浮窗默认开启，用户可在设置页关闭；关闭后 watcher 继续运行，但忽略 selection 弹窗事件。
+- 已经复制、翻译、关闭或外部隐藏的同一段自动选区会被抑制，不再重复弹出，直到选区清空或文本变化。
+- 自动选区 watcher 失败或无辅助功能权限时，不弹错误打扰阅读，继续保留双复制兜底。
 - 使用 macOS `NSPasteboard.general.changeCount` 监听剪贴板变化。
 - 轮询间隔固定为 `50ms`。
 - 两次复制窗口固定为 `900ms`。
@@ -222,12 +243,13 @@ interface TranslateResult {
 
 默认 system prompt 目标：
 
-- 面向英文学术论文翻译。
-- 翻译成准确、自然、适合中文学术阅读的中文。
+- 面向多语言学术内容翻译。
+- 自动识别用户提供的原文语言，不要求源语言必须是英文。
+- 翻译成准确、自然、适合目标语言学术阅读的内容。
 - 保留公式、变量名、引用编号、专有名词。
-- 必要时在中文译名后保留英文术语。
+- 必要时在目标语言译名后保留原文术语。
 - 只输出译文，不输出解释。
-- 术语模式必须输出纯文本列表，格式为 `英文术语：中文译名。说明：一句话解释。`，不使用 Markdown。
+- 术语模式必须输出纯文本列表，格式为 `原文术语：目标语言译名。说明：用目标语言一句话解释。`，不使用 Markdown。
 
 ## Text Cleaning
 
@@ -255,7 +277,7 @@ interface TranslateResult {
 缓存 key：
 
 ```text
-sha256(model + mode + glossaryVersion + cleanedText)
+sha256(model + mode + targetLanguage + glossaryVersion + cleanedText)
 ```
 
 缓存命中时不调用 DeepSeek。
@@ -264,17 +286,23 @@ sha256(model + mode + glossaryVersion + cleanedText)
 
 浮窗行为：
 
-- 默认显示在鼠标右下方。
+- 默认显示在触发位置右下方。
 - 靠近屏幕边缘时自动反向避让。
+- 选区状态是紧凑按钮条，只显示“复制 / 翻译 / 关闭”，不展示选中文本。
+- 选区浮窗固定在鼠标松开位置附近，不跟随之后的鼠标移动。
+- 未固定浮窗获得焦点后，点击外部会因失焦关闭；全局鼠标按下事件也会关闭外部点击。
 - loading 状态显示“正在翻译”。
 - 成功后显示译文。
 - 失败后显示可读错误。
+- 结果浮窗提供目标语言输入框；修改后点击“重译”才重新请求。
 - Esc 关闭浮窗。
 - 固定后不因失焦自动关闭。
 - 未固定时可点击外部关闭。
 
 浮窗按钮：
 
+- 复制
+- 翻译选区
 - 复制译文
 - 固定 / 取消固定
 - 重新翻译
@@ -285,6 +313,10 @@ sha256(model + mode + glossaryVersion + cleanedText)
 - API Key 输入和保存
 - 默认模型选择
 - 翻译模式选择
+- 默认目标语言输入
+- 拖选后显示操作浮窗开关
+- 自动选区监听状态
+- 辅助功能权限入口
 - 双复制监听状态
 - PDF 清洗开关
 - 缓存开关
@@ -302,8 +334,10 @@ sha256(model + mode + glossaryVersion + cleanedText)
 
 集成测试：
 
+- macOS 自动选区监听触发操作浮窗
 - macOS 双复制触发
 - 非 macOS 显示不支持状态
+- 复制选区原文不请求 API
 - 空剪贴板或非文本复制显示错误
 - 空选区不请求 API
 - 缓存命中不请求 API
@@ -313,17 +347,19 @@ sha256(model + mode + glossaryVersion + cleanedText)
 
 验收标准：
 
-- 浏览器、PDF 阅读器、Word、Zotero 中选中文本后，快速按两次 `Cmd+C` 可以弹出译文。
+- TextEdit 和浏览器中拖选文本时不弹窗，鼠标松开后才自动弹出操作浮窗。
+- 支持 Accessibility 选区读取的 PDF 阅读器、Word、Zotero 场景中，拖选松开后能自动弹出操作浮窗。
+- 不支持自动选区读取的应用中，快速按两次 `Cmd+C` 仍可弹出译文。
 - 翻译完成后剪贴板仍保留用户复制的原文。
-- 无 API Key、网络失败、双复制监听失败时都有明确提示。
+- 无 API Key、网络失败、辅助功能权限缺失、双复制监听失败时都有明确提示。
 - API Key 不出现在 renderer、日志或仓库。
 - 同一句文本重复翻译能命中缓存。
 - 第一版可在本机开发运行和构建。
 
 ## Assumptions
 
-- 第一版采用 macOS 优先架构，Windows/Linux 暂时显示双复制不支持。
-- `Cmd+C+C` 是桌面端第一版唯一触发方式。
+- 第一版采用 macOS 优先架构，Windows/Linux 暂时显示自动选区和双复制不支持。
+- 自动选区操作浮窗是主触发方式，`Cmd+C+C` 是稳定兜底触发方式。
 - 浏览器插件后置，不阻塞桌面 MVP。
 - 第一版是本机可用版，不做签名、公证、自动更新。
 - DeepSeek 是第一版唯一 provider，但 adapter 保持可扩展。

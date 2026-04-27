@@ -6,12 +6,14 @@ describe("cache keys", () => {
     const left = await createCacheKey({
       model: "deepseek-v4-flash",
       mode: "academic_zh",
+      targetLanguage: "中文",
       glossaryVersion: "v1",
       cleanedText: "hello"
     });
     const right = await createCacheKey({
       model: "deepseek-v4-flash",
       mode: "academic_zh",
+      targetLanguage: "中文",
       glossaryVersion: "v1",
       cleanedText: "hello"
     });
@@ -23,17 +25,38 @@ describe("cache keys", () => {
     const flash = await createCacheKey({
       model: "deepseek-v4-flash",
       mode: "academic_zh",
+      targetLanguage: "中文",
       glossaryVersion: "v1",
       cleanedText: "hello"
     });
     const pro = await createCacheKey({
       model: "deepseek-v4-pro",
       mode: "academic_zh",
+      targetLanguage: "中文",
       glossaryVersion: "v1",
       cleanedText: "hello"
     });
 
     expect(flash).not.toBe(pro);
+  });
+
+  it("changes when target language changes", async () => {
+    const chinese = await createCacheKey({
+      model: "deepseek-v4-flash",
+      mode: "academic_zh",
+      targetLanguage: "中文",
+      glossaryVersion: "v1",
+      cleanedText: "hello"
+    });
+    const japanese = await createCacheKey({
+      model: "deepseek-v4-flash",
+      mode: "academic_zh",
+      targetLanguage: "日文",
+      glossaryVersion: "v1",
+      cleanedText: "hello"
+    });
+
+    expect(chinese).not.toBe(japanese);
   });
 
   it("normalizes glossary version by key order", async () => {

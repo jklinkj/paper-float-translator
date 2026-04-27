@@ -1,5 +1,6 @@
 import {
   buildSystemPrompt,
+  normalizeTargetLanguage,
   normalizeTerminologyOutput,
   type TranslateRequest,
   type TranslateResult
@@ -53,6 +54,7 @@ export class DeepSeekClient {
 
   async translate(request: TranslateRequest): Promise<TranslateResult> {
     const cleanedText = request.text.trim();
+    const targetLanguage = normalizeTargetLanguage(request.targetLanguage);
 
     if (!cleanedText) {
       return {
@@ -75,7 +77,7 @@ export class DeepSeekClient {
         messages: [
           {
             role: "system",
-            content: buildSystemPrompt(request.mode, request.glossary)
+            content: buildSystemPrompt(request.mode, targetLanguage, request.glossary)
           },
           {
             role: "user",

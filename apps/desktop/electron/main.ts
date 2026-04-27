@@ -18,9 +18,11 @@ import {
   cleanSelectedText,
   createCacheKey,
   DEFAULT_SETTINGS,
+  normalizeTargetLanguage,
   type AppSettings,
   type PopupState,
-  type TranslateMode
+  type TranslateMode,
+  type WatcherStatus
 } from "@paper-float-translator/core";
 import { DeepSeekClient } from "@paper-float-translator/deepseek";
 import {
@@ -32,10 +34,15 @@ import {
 } from "@paper-float-translator/storage";
 
 const POPUP_DEFAULT_HEIGHT = 260;
+const SELECTION_POPUP_WIDTH = 320;
+const SELECTION_POPUP_HEIGHT = 56;
 const POPUP_OFFSET = 18;
 const DOUBLE_COPY_POLL_INTERVAL_SECONDS = 0.05;
 const DOUBLE_COPY_WINDOW_MS = 900;
 const DOUBLE_COPY_COOLDOWN_MS = 1000;
+const SELECTION_READ_DELAY_SECONDS = 0.1;
+const SELECTION_EMPTY_STATUS_COOLDOWN_SECONDS = 1.5;
+const SELECTION_POPUP_COOLDOWN_MS = 800;
 const KEYCHAIN_SERVICE = "Paper Float Translator";
 const DEEPSEEK_ACCOUNT = "deepseek-api-key";
 
@@ -53,14 +60,15 @@ let lastCleanedText = "";
 let macDoubleCopyWatcher: ChildProcessWithoutNullStreams | null = null;
 let macDoubleCopyStatus = buildInitialDoubleCopyStatus();
 let macDoubleCopyBuffer = "";
+let macSelectionWatcher: ChildProcessWithoutNullStreams | null = null;
+let macSelectionStatus = buildInitialSelectionStatus();
+let macSelectionBuffer = "";
 let lastMacCopy: { text: string; copiedAt: number } | null = null;
 let lastDoubleCopyTrigger: { text: string; triggeredAt: number } | null = null;
-
-interface DoubleCopyStatus {
-  available: boolean;
-  running: boolean;
-  message: string;
-}
+let lastSelectionPopup: { text: string; shownAt: number } | null = null;
+let lastSelectionEmptyAt = 0;
+let suppressedSelectionText: string | null = null;
+let activeSelectionText: string | null = null;
 
 const MAC_PASTEBOARD_WATCHER_SCRIPT = `
 import AppKit
@@ -84,12 +92,361 @@ while true {
 }
 `;
 
+const MAC_SELECTION_WATCHER_SCRIPT = `
+import AppKit
+import ApplicationServices
+import CoreGraphics
+import Foundation
+
+var didDrag = false
+var mouseDownLocation: CGPoint?
+var lastEmittedSelection = ""
+var lastEmptyStatusAt = 0.0
+let dragDistanceThreshold = 4.0
+
+func encode(_ text: String) -> String {
+  return text.data(using: .utf8)?.base64EncodedString() ?? ""
+}
+
+func emitStatus(_ status: String) {
+  print("status\\t\\(status)")
+  fflush(stdout)
+}
+
+func emitSelection(_ text: String, anchor: CGPoint) {
+  print("selection\\t\\(encode(text))\\t\\(anchor.x)\\t\\(anchor.y)")
+  fflush(stdout)
+}
+
+func emitMouseDown(_ location: CGPoint) {
+  print("mouse_down\\t\\(location.x)\\t\\(location.y)")
+  fflush(stdout)
+}
+
+func emitEmptyStatusIfNeeded() {
+  let now = Date().timeIntervalSince1970
+
+  if now - lastEmptyStatusAt >= ${SELECTION_EMPTY_STATUS_COOLDOWN_SECONDS} {
+    emitStatus("selection_empty")
+    lastEmptyStatusAt = now
+  }
+}
+
+func trimmed(_ text: String) -> String {
+  return text.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+func copyAttribute(_ element: AXUIElement, _ attribute: CFString) -> AnyObject? {
+  var value: AnyObject?
+  let error = AXUIElementCopyAttributeValue(element, attribute, &value)
+  return error == .success ? value : nil
+}
+
+func stringForRange(_ element: AXUIElement, _ rangeValue: AXValue) -> String? {
+  var range = CFRange()
+
+  guard AXValueGetType(rangeValue) == .cfRange,
+        AXValueGetValue(rangeValue, .cfRange, &range),
+        range.length > 0 else {
+    return nil
+  }
+
+  var result: AnyObject?
+  let error = AXUIElementCopyParameterizedAttributeValue(
+    element,
+    kAXStringForRangeParameterizedAttribute as CFString,
+    rangeValue,
+    &result
+  )
+
+  guard error == .success, let text = result as? String, !trimmed(text).isEmpty else {
+    return nil
+  }
+
+  return text
+}
+
+func selectedText(from element: AXUIElement) -> String? {
+  if let direct = copyAttribute(element, kAXSelectedTextAttribute as CFString) as? String,
+     !trimmed(direct).isEmpty {
+    return direct
+  }
+
+  if let rawRangeValue = copyAttribute(element, kAXSelectedTextRangeAttribute as CFString),
+     CFGetTypeID(rawRangeValue) == AXValueGetTypeID() {
+    let rangeValue = rawRangeValue as! AXValue
+
+    if let text = stringForRange(element, rangeValue) {
+      return text
+    }
+  }
+
+  if let rawRangeValues = copyAttribute(element, kAXSelectedTextRangesAttribute as CFString) as? [AnyObject] {
+    let parts = rawRangeValues.compactMap { rawRangeValue -> String? in
+      guard CFGetTypeID(rawRangeValue) == AXValueGetTypeID() else {
+        return nil
+      }
+
+      return stringForRange(element, rawRangeValue as! AXValue)
+    }
+    let combined = parts.joined(separator: "\\n")
+
+    if !trimmed(combined).isEmpty {
+      return combined
+    }
+  }
+
+  return nil
+}
+
+func parent(of element: AXUIElement) -> AXUIElement? {
+  guard let value = copyAttribute(element, kAXParentAttribute as CFString),
+        CFGetTypeID(value) == AXUIElementGetTypeID() else {
+    return nil
+  }
+
+  return (value as! AXUIElement)
+}
+
+func selectedTextFromElementOrParents(_ element: AXUIElement) -> String? {
+  var current: AXUIElement? = element
+  var depth = 0
+
+  while let candidate = current, depth < 8 {
+    if let text = selectedText(from: candidate) {
+      return text
+    }
+
+    current = parent(of: candidate)
+    depth += 1
+  }
+
+  return nil
+}
+
+func focusedElement() -> AXUIElement? {
+  let systemWide = AXUIElementCreateSystemWide()
+  var value: AnyObject?
+  let error = AXUIElementCopyAttributeValue(
+    systemWide,
+    kAXFocusedUIElementAttribute as CFString,
+    &value
+  )
+
+  guard error == .success,
+        let element = value,
+        CFGetTypeID(element) == AXUIElementGetTypeID() else {
+    return nil
+  }
+
+  return (element as! AXUIElement)
+}
+
+func focusedWindow(from appElement: AXUIElement) -> AXUIElement? {
+  guard let value = copyAttribute(appElement, kAXFocusedWindowAttribute as CFString),
+        CFGetTypeID(value) == AXUIElementGetTypeID() else {
+    return nil
+  }
+
+  return (value as! AXUIElement)
+}
+
+func frontmostAppElement() -> AXUIElement? {
+  guard let app = NSWorkspace.shared.frontmostApplication else {
+    return nil
+  }
+
+  return AXUIElementCreateApplication(app.processIdentifier)
+}
+
+func elementAtMouseLocation() -> AXUIElement? {
+  let systemWide = AXUIElementCreateSystemWide()
+  let location = NSEvent.mouseLocation
+  let screenMaxY = NSScreen.screens.map { $0.frame.maxY }.max() ?? 0
+  let points = [
+    CGPoint(x: location.x, y: location.y),
+    CGPoint(x: location.x, y: screenMaxY - location.y)
+  ]
+
+  for point in points {
+    var value: AXUIElement?
+    let error = AXUIElementCopyElementAtPosition(systemWide, Float(point.x), Float(point.y), &value)
+
+    if error == .success, let element = value {
+      return element
+    }
+  }
+
+  return nil
+}
+
+func childElements(of element: AXUIElement) -> [AXUIElement] {
+  guard let children = copyAttribute(element, kAXChildrenAttribute as CFString) as? [AnyObject] else {
+    return []
+  }
+
+  return children.compactMap { child in
+    guard CFGetTypeID(child) == AXUIElementGetTypeID() else {
+      return nil
+    }
+
+    return (child as! AXUIElement)
+  }
+}
+
+func selectedTextBySearchingChildren(from root: AXUIElement) -> String? {
+  var queue: [(AXUIElement, Int)] = [(root, 0)]
+  var visited = 0
+
+  while !queue.isEmpty && visited < 160 {
+    let (element, depth) = queue.removeFirst()
+    visited += 1
+
+    if let text = selectedText(from: element) {
+      return text
+    }
+
+    if depth < 4 {
+      for child in childElements(of: element) {
+        queue.append((child, depth + 1))
+      }
+    }
+  }
+
+  return nil
+}
+
+func currentSelectedText() -> String? {
+  var candidates: [AXUIElement] = []
+
+  if let element = elementAtMouseLocation() {
+    candidates.append(element)
+  }
+
+  if let element = focusedElement() {
+    candidates.append(element)
+  }
+
+  if let appElement = frontmostAppElement() {
+    candidates.append(appElement)
+
+    if let window = focusedWindow(from: appElement) {
+      candidates.append(window)
+    }
+  }
+
+  for candidate in candidates {
+    if let text = selectedTextFromElementOrParents(candidate) {
+      return text
+    }
+  }
+
+  for candidate in candidates {
+    if let text = selectedTextBySearchingChildren(from: candidate) {
+      return text
+    }
+  }
+
+  return nil
+}
+
+func readCurrentSelection(anchor: CGPoint) {
+  guard AXIsProcessTrusted() else {
+    emitStatus("accessibility_denied")
+    return
+  }
+
+  guard let text = currentSelectedText(),
+        !trimmed(text).isEmpty else {
+    lastEmittedSelection = ""
+    emitEmptyStatusIfNeeded()
+    return
+  }
+
+  let normalized = trimmed(text)
+
+  if normalized != lastEmittedSelection {
+    lastEmittedSelection = normalized
+    emitSelection(text, anchor: anchor)
+  }
+}
+
+let trustOptions = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+
+if !AXIsProcessTrustedWithOptions(trustOptions) {
+  emitStatus("accessibility_denied")
+} else {
+  emitStatus("ready")
+}
+
+let eventMask =
+  (1 << CGEventType.leftMouseDown.rawValue) |
+  (1 << CGEventType.leftMouseDragged.rawValue) |
+  (1 << CGEventType.leftMouseUp.rawValue)
+
+let eventTap = CGEvent.tapCreate(
+  tap: .cgSessionEventTap,
+  place: .headInsertEventTap,
+  options: .listenOnly,
+  eventsOfInterest: CGEventMask(eventMask),
+  callback: { _, type, event, _ in
+    let location = event.location
+
+    switch type {
+    case .leftMouseDown:
+      emitMouseDown(location)
+      mouseDownLocation = location
+      didDrag = false
+    case .leftMouseDragged:
+      didDrag = true
+    case .leftMouseUp:
+      let anchor = location
+      let movedEnough: Bool
+
+      if let start = mouseDownLocation {
+        let dx = anchor.x - start.x
+        let dy = anchor.y - start.y
+        movedEnough = sqrt(dx * dx + dy * dy) >= dragDistanceThreshold
+      } else {
+        movedEnough = false
+      }
+
+      let shouldRead = didDrag || movedEnough
+      didDrag = false
+      mouseDownLocation = nil
+
+      if shouldRead {
+        DispatchQueue.main.asyncAfter(deadline: .now() + ${SELECTION_READ_DELAY_SECONDS}) {
+          readCurrentSelection(anchor: anchor)
+        }
+      }
+    default:
+      break
+    }
+
+    return Unmanaged.passUnretained(event)
+  },
+  userInfo: nil
+)
+
+if let eventTap = eventTap {
+  let runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
+  CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
+  CGEvent.tapEnable(tap: eventTap, enable: true)
+} else {
+  emitStatus("mouse_tap_unavailable")
+}
+
+RunLoop.current.run()
+`;
+
 app.whenReady().then(async () => {
   createStores();
   settings = await settingsStore.load();
   setupApplicationMenu();
   setupIpcHandlers();
   startMacDoubleCopyWatcher();
+  startMacSelectionWatcher();
   await createSettingsWindow();
   await prewarmPopupWindow();
 });
@@ -100,6 +457,7 @@ app.on("activate", () => {
 
 app.on("will-quit", () => {
   stopMacDoubleCopyWatcher();
+  stopMacSelectionWatcher();
 });
 
 function createStores(): void {
@@ -143,15 +501,26 @@ function setupApplicationMenu(): void {
 function setupIpcHandlers(): void {
   ipcMain.handle("settings:get", async () => {
     settings = await settingsStore.load();
+    refreshMacSelectionWatcherStatus();
     return {
       settings,
       hasApiKey: Boolean(await getApiKeySafely()),
-      doubleCopyStatus: macDoubleCopyStatus
+      doubleCopyStatus: macDoubleCopyStatus,
+      selectionStatus: macSelectionStatus
     };
   });
 
   ipcMain.handle("settings:save", async (_event, nextSettings: AppSettings) => {
     settings = await settingsStore.save(nextSettings);
+
+    if (!settings.enableSelectionPopup) {
+      if (currentPopupState.status === "selection") {
+        suppressCurrentSelection();
+        popupWindow?.hide();
+      }
+      clearSuppressedSelection();
+    }
+
     resizeExistingPopupToSettings();
     return settings;
   });
@@ -177,13 +546,29 @@ function setupIpcHandlers(): void {
     await createSettingsWindow();
   });
 
+  ipcMain.handle("app:openAccessibilitySettings", async () => {
+    if (process.platform === "darwin") {
+      await shell.openExternal("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility");
+    }
+  });
+
   ipcMain.handle("popup:copyTranslation", () => {
     if (currentPopupState.translation) {
       clipboard.writeText(currentPopupState.translation);
     }
   });
 
+  ipcMain.handle("popup:copySource", () => {
+    const text = currentPopupState.sourceText ?? currentPopupState.selectedText ?? currentPopupState.cleanedText;
+
+    if (text) {
+      clipboard.writeText(text);
+      suppressCurrentSelection();
+    }
+  });
+
   ipcMain.handle("popup:close", () => {
+    suppressCurrentSelection();
     popupWindow?.hide();
   });
 
@@ -191,20 +576,59 @@ function setupIpcHandlers(): void {
     updatePopupState({ ...currentPopupState, pinned: !currentPopupState.pinned });
   });
 
-  ipcMain.handle("popup:retry", async () => {
-    if (lastCleanedText) {
-      await translateText(lastCleanedText, { bypassCache: true, mode: settings.mode });
+  ipcMain.handle("popup:translateSelection", async () => {
+    const cleanedText = currentPopupState.cleanedText;
+    const targetLanguage = normalizeTargetLanguage(settings.targetLanguage);
+
+    if (cleanedText) {
+      suppressCurrentSelection();
+      lastCleanedText = cleanedText;
+      try {
+        await translateText(cleanedText, { bypassCache: false, mode: settings.mode, targetLanguage });
+      } catch (error) {
+        updatePopupState({
+          status: "error",
+          pinned: currentPopupState.pinned,
+          cleanedText,
+          targetLanguage,
+          error: toUserMessage(error)
+        });
+      }
     }
   });
 
-  ipcMain.handle("popup:explainTerms", async () => {
+  ipcMain.handle("popup:retry", async (_event, targetLanguage?: string) => {
     if (lastCleanedText) {
-      await translateText(lastCleanedText, { bypassCache: true, mode: "terminology" });
+      await translateText(lastCleanedText, {
+        bypassCache: true,
+        mode: settings.mode,
+        targetLanguage: resolvePopupTargetLanguage(targetLanguage)
+      });
+    }
+  });
+
+  ipcMain.handle("popup:explainTerms", async (_event, targetLanguage?: string) => {
+    if (lastCleanedText) {
+      await translateText(lastCleanedText, {
+        bypassCache: true,
+        mode: "terminology",
+        targetLanguage: resolvePopupTargetLanguage(targetLanguage)
+      });
     }
   });
 
   ipcMain.handle("popup:resize", (_event, requestedHeight: number) => {
     if (!popupWindow) {
+      return;
+    }
+
+    if (currentPopupState.status === "selection") {
+      popupWindow.setSize(SELECTION_POPUP_WIDTH, SELECTION_POPUP_HEIGHT, false);
+
+      if (lastCursorPoint) {
+        positionPopup(lastCursorPoint, SELECTION_POPUP_WIDTH, SELECTION_POPUP_HEIGHT);
+      }
+
       return;
     }
 
@@ -225,6 +649,7 @@ function setupIpcHandlers(): void {
 
 async function translateCopiedText(rawText: string): Promise<void> {
   const cleanedText = cleanSelectedText(rawText, { enabled: settings.cleanPdfText });
+  const targetLanguage = normalizeTargetLanguage(settings.targetLanguage);
 
   if (!cleanedText) {
     await showPopup({
@@ -232,28 +657,75 @@ async function translateCopiedText(rawText: string): Promise<void> {
       pinned: currentPopupState.pinned,
       error: buildEmptyClipboardMessage(),
       sourceText: rawText,
-      cleanedText: ""
+      cleanedText: "",
+      targetLanguage
     });
     return;
   }
 
   lastCleanedText = cleanedText;
+  activeSelectionText = null;
   try {
-    await translateText(cleanedText, { bypassCache: false, mode: settings.mode });
+    await translateText(cleanedText, { bypassCache: false, mode: settings.mode, targetLanguage });
   } catch (error) {
     updatePopupState({
       status: "error",
       pinned: currentPopupState.pinned,
       error: toUserMessage(error),
-      cleanedText
+      cleanedText,
+      targetLanguage
     });
   }
 }
 
+async function showSelectionPopup(rawText: string, anchorPoint: Point): Promise<void> {
+  if (!settings.enableSelectionPopup) {
+    return;
+  }
+
+  const cleanedText = cleanSelectedText(rawText, { enabled: settings.cleanPdfText });
+
+  if (!cleanedText) {
+    return;
+  }
+
+  if (shouldSuppressSelection(cleanedText)) {
+    return;
+  }
+
+  if (suppressedSelectionText && suppressedSelectionText !== cleanedText) {
+    clearSuppressedSelection();
+  }
+
+  const shownAt = Date.now();
+
+  if (
+    lastSelectionPopup &&
+    lastSelectionPopup.text === cleanedText &&
+    shownAt - lastSelectionPopup.shownAt <= SELECTION_POPUP_COOLDOWN_MS
+  ) {
+    return;
+  }
+
+  lastSelectionPopup = { text: cleanedText, shownAt };
+  lastCleanedText = cleanedText;
+  activeSelectionText = cleanedText;
+  lastCursorPoint = anchorPoint;
+
+  await showPopup({
+    status: "selection",
+    pinned: false,
+    sourceText: rawText,
+    selectedText: cleanedText,
+    cleanedText
+  });
+}
+
 async function translateText(
   cleanedText: string,
-  options: { bypassCache: boolean; mode: TranslateMode }
+  options: { bypassCache: boolean; mode: TranslateMode; targetLanguage: string }
 ): Promise<void> {
+  const targetLanguage = normalizeTargetLanguage(options.targetLanguage, settings.targetLanguage);
   lastCursorPoint = lastCursorPoint ?? screen.getCursorScreenPoint();
   await showPopup({
     status: "loading",
@@ -261,7 +733,8 @@ async function translateText(
     cleanedText,
     sourceText: cleanedText,
     translation: "",
-    cached: false
+    cached: false,
+    targetLanguage
   });
 
   const apiKey = await getApiKeySafely();
@@ -271,6 +744,7 @@ async function translateText(
       status: "error",
       pinned: currentPopupState.pinned,
       cleanedText,
+      targetLanguage,
       error: "请先在设置页保存 DeepSeek API Key。"
     });
     await createSettingsWindow();
@@ -282,6 +756,7 @@ async function translateText(
   const cacheKey = await createCacheKey({
     model: settings.model,
     mode: options.mode,
+    targetLanguage,
     glossaryVersion,
     cleanedText
   });
@@ -295,7 +770,8 @@ async function translateText(
         pinned: currentPopupState.pinned,
         cleanedText,
         translation: cached.translation,
-        cached: true
+        cached: true,
+        targetLanguage
       });
       return;
     }
@@ -306,6 +782,7 @@ async function translateText(
     text: cleanedText,
     model: settings.model,
     mode: options.mode,
+    targetLanguage,
     glossary
   });
 
@@ -316,6 +793,7 @@ async function translateText(
       translation: result.translation,
       model: settings.model,
       mode: options.mode,
+      targetLanguage,
       glossaryVersion,
       createdAt: new Date().toISOString()
     });
@@ -326,8 +804,13 @@ async function translateText(
     pinned: currentPopupState.pinned,
     cleanedText,
     translation: result.translation,
-    cached: false
+    cached: false,
+    targetLanguage
   });
+}
+
+function resolvePopupTargetLanguage(value: unknown): string {
+  return normalizeTargetLanguage(value, currentPopupState.targetLanguage ?? settings.targetLanguage);
 }
 
 function buildEmptyClipboardMessage(): string {
@@ -425,6 +908,264 @@ function stopMacDoubleCopyWatcher(): void {
   lastDoubleCopyTrigger = null;
 }
 
+function startMacSelectionWatcher(): void {
+  if (process.platform !== "darwin") {
+    macSelectionStatus = {
+      available: false,
+      running: false,
+      message: "自动选区浮窗目前仅支持 macOS。"
+    };
+    return;
+  }
+
+  if (macSelectionWatcher) {
+    macSelectionStatus = {
+      available: true,
+      running: true,
+      message: "自动选区浮窗监听已启用。"
+    };
+    return;
+  }
+
+  try {
+    macSelectionBuffer = "";
+    lastSelectionPopup = null;
+    macSelectionWatcher = spawn("/usr/bin/swift", ["-e", MAC_SELECTION_WATCHER_SCRIPT], {
+      stdio: "pipe"
+    }) as ChildProcessWithoutNullStreams;
+    macSelectionStatus = {
+      available: true,
+      running: true,
+      message: "自动选区浮窗监听已启用。"
+    };
+
+    macSelectionWatcher.stdout.setEncoding("utf8");
+    macSelectionWatcher.stdout.on("data", (chunk: string) => {
+      macSelectionBuffer += chunk;
+      const lines = macSelectionBuffer.split(/\r?\n/);
+      macSelectionBuffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        handleMacSelectionWatcherLine(line);
+      }
+    });
+
+    macSelectionWatcher.stderr.setEncoding("utf8");
+    macSelectionWatcher.stderr.on("data", (chunk: string) => {
+      devLog("macOS selection watcher stderr.", chunk.slice(0, 240));
+    });
+
+    macSelectionWatcher.on("error", (error) => {
+      macSelectionStatus = {
+        available: false,
+        running: false,
+        message: `自动选区浮窗监听启动失败：${error.message}`
+      };
+      macSelectionWatcher = null;
+    });
+
+    macSelectionWatcher.on("close", (code) => {
+      macSelectionStatus = {
+        available: false,
+        running: false,
+        message: code === 0 ? "自动选区浮窗监听已停止。" : "自动选区浮窗监听已退出，请重启应用。"
+      };
+
+      macSelectionWatcher = null;
+      macSelectionBuffer = "";
+      lastSelectionPopup = null;
+    });
+  } catch (error) {
+    macSelectionStatus = {
+      available: false,
+      running: false,
+      message: error instanceof Error ? `自动选区浮窗监听启动失败：${error.message}` : "自动选区浮窗监听启动失败。"
+    };
+  }
+}
+
+function stopMacSelectionWatcher(): void {
+  if (!macSelectionWatcher) {
+    return;
+  }
+
+  const watcher = macSelectionWatcher;
+  macSelectionWatcher = null;
+  watcher.kill();
+  macSelectionBuffer = "";
+  lastSelectionPopup = null;
+}
+
+function refreshMacSelectionWatcherStatus(): void {
+  if (process.platform !== "darwin") {
+    macSelectionStatus = {
+      available: false,
+      running: false,
+      message: "自动选区浮窗目前仅支持 macOS。"
+    };
+    return;
+  }
+
+  if (!macSelectionWatcher) {
+    startMacSelectionWatcher();
+    return;
+  }
+
+  if (macSelectionStatus.available) {
+    macSelectionStatus = {
+      available: true,
+      running: true,
+      message:
+        lastSelectionEmptyAt > 0
+          ? "自动选区监听已启用；当前前台应用暂未通过辅助功能暴露选中文本，可用 Cmd+C+C 兜底。"
+          : "自动选区浮窗监听已启用。"
+    };
+  }
+}
+
+function handleMacSelectionWatcherLine(line: string): void {
+  const [kind, payload, rawX, rawY] = line.split("\t");
+
+  if (kind === "mouse_down") {
+    hidePopupIfUnpinned(parseSelectionAnchor(payload, rawX));
+    return;
+  }
+
+  if (kind === "status") {
+    handleMacSelectionStatus(payload);
+    return;
+  }
+
+  if (kind !== "selection" || !payload || BrowserWindow.getFocusedWindow()) {
+    return;
+  }
+
+  if (!settings.enableSelectionPopup) {
+    clearSuppressedSelection();
+    return;
+  }
+
+  const text = Buffer.from(payload, "base64").toString("utf8");
+  const anchorPoint = parseSelectionAnchor(rawX, rawY);
+  lastSelectionEmptyAt = 0;
+  macSelectionStatus = {
+    available: true,
+    running: Boolean(macSelectionWatcher),
+    message: "自动选区浮窗监听已启用。"
+  };
+  void handleMacSelectionDetected(text, anchorPoint);
+}
+
+function parseSelectionAnchor(rawX: string | undefined, rawY: string | undefined): Point {
+  const x = rawX ? Number(rawX) : Number.NaN;
+  const y = rawY ? Number(rawY) : Number.NaN;
+
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    return screen.getCursorScreenPoint();
+  }
+
+  return { x: Math.round(x), y: Math.round(y) };
+}
+
+function hidePopupIfUnpinned(mousePoint?: Point): void {
+  if (!popupWindow || popupWindow.isDestroyed() || !popupWindow.isVisible() || currentPopupState.pinned) {
+    return;
+  }
+
+  if (mousePoint && isPointInsidePopup(mousePoint)) {
+    return;
+  }
+
+  suppressCurrentSelection();
+  popupWindow.hide();
+}
+
+function suppressCurrentSelection(): void {
+  const cleanedText = currentPopupState.cleanedText ?? activeSelectionText;
+
+  if (!cleanedText) {
+    return;
+  }
+
+  if (currentPopupState.status === "selection" || activeSelectionText === cleanedText) {
+    suppressedSelectionText = cleanedText;
+  }
+}
+
+function clearSuppressedSelection(): void {
+  suppressedSelectionText = null;
+  activeSelectionText = null;
+}
+
+function shouldSuppressSelection(cleanedText: string): boolean {
+  return suppressedSelectionText === cleanedText;
+}
+
+function isPointInsidePopup(point: Point): boolean {
+  if (!popupWindow || popupWindow.isDestroyed()) {
+    return false;
+  }
+
+  const bounds = popupWindow.getBounds();
+  return (
+    point.x >= bounds.x &&
+    point.x <= bounds.x + bounds.width &&
+    point.y >= bounds.y &&
+    point.y <= bounds.y + bounds.height
+  );
+}
+
+function handleMacSelectionStatus(status: string | undefined): void {
+  if (status === "accessibility_denied") {
+    macSelectionStatus = {
+      available: false,
+      running: false,
+      message: "自动选区浮窗需要 macOS 辅助功能权限；未授权时仍可使用 Cmd+C+C。"
+    };
+    return;
+  }
+
+  if (status === "ready") {
+    macSelectionStatus = {
+      available: true,
+      running: Boolean(macSelectionWatcher),
+      message: "自动选区浮窗监听已启用。"
+    };
+    return;
+  }
+
+  if (status === "selection_empty") {
+    lastSelectionEmptyAt = Date.now();
+    clearSuppressedSelection();
+    macSelectionStatus = {
+      available: true,
+      running: Boolean(macSelectionWatcher),
+      message: "自动选区监听已启用；当前前台应用暂未通过辅助功能暴露选中文本，可用 Cmd+C+C 兜底。"
+    };
+    return;
+  }
+
+  if (status === "mouse_tap_unavailable") {
+    macSelectionStatus = {
+      available: false,
+      running: false,
+      message: "自动选区鼠标监听启动失败；请检查 macOS 辅助功能权限，或继续使用 Cmd+C+C。"
+    };
+  }
+}
+
+async function handleMacSelectionDetected(rawText: string, anchorPoint: Point): Promise<void> {
+  if (!settings.enableSelectionPopup) {
+    return;
+  }
+
+  try {
+    await showSelectionPopup(rawText, anchorPoint);
+  } catch (error) {
+    devLog("Selection popup failed.", toUserMessage(error));
+  }
+}
+
 function handleMacPasteboardChange(line: string): void {
   const [, encodedText] = line.split("\t");
 
@@ -480,7 +1221,7 @@ function wasRecentlyTriggered(text: string, copiedAt: number): boolean {
   );
 }
 
-function buildInitialDoubleCopyStatus(): DoubleCopyStatus {
+function buildInitialDoubleCopyStatus(): WatcherStatus {
   if (process.platform !== "darwin") {
     return {
       available: false,
@@ -493,6 +1234,22 @@ function buildInitialDoubleCopyStatus(): DoubleCopyStatus {
     available: true,
     running: false,
     message: "双复制监听未启用。"
+  };
+}
+
+function buildInitialSelectionStatus(): WatcherStatus {
+  if (process.platform !== "darwin") {
+    return {
+      available: false,
+      running: false,
+      message: "自动选区浮窗目前仅支持 macOS。"
+    };
+  }
+
+  return {
+    available: true,
+    running: false,
+    message: "自动选区浮窗监听未启用。"
   };
 }
 
@@ -553,6 +1310,10 @@ async function ensurePopupWindow(): Promise<BrowserWindow> {
     popupWindow = null;
   });
 
+  popupWindow.on("blur", () => {
+    hidePopupIfUnpinned();
+  });
+
   popupWindow.webContents.on("did-finish-load", () => {
     sendPopupState();
   });
@@ -572,13 +1333,26 @@ async function prewarmPopupWindow(): Promise<void> {
 async function showPopup(state: PopupState): Promise<void> {
   updatePopupState(state);
   const popup = await ensurePopupWindow();
-  resizeExistingPopupToSettings();
+  resizePopupForState(state);
   const [width, height] = popup.getSize();
   positionPopup(lastCursorPoint ?? screen.getCursorScreenPoint(), width, height);
-  popup.showInactive();
+  popup.show();
   popup.moveTop();
   devLog("Popup shown.", { visible: popup.isVisible(), bounds: popup.getBounds() });
   sendPopupState();
+}
+
+function resizePopupForState(state: PopupState): void {
+  if (!popupWindow || popupWindow.isDestroyed()) {
+    return;
+  }
+
+  if (state.status === "selection") {
+    popupWindow.setSize(SELECTION_POPUP_WIDTH, SELECTION_POPUP_HEIGHT, false);
+    return;
+  }
+
+  resizeExistingPopupToSettings();
 }
 
 function resizeExistingPopupToSettings(): void {

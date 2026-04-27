@@ -1,33 +1,40 @@
-import type { Glossary, TranslateMode } from "./types";
+import { DEFAULT_TARGET_LANGUAGE, normalizeTargetLanguage, type Glossary, type TranslateMode } from "./types";
 
-const MODE_INSTRUCTIONS: Record<TranslateMode, string> = {
-  academic_zh:
-    "请将英文论文内容翻译为准确、自然、适合中文学术阅读的中文。只输出译文，不要解释。",
-  bilingual:
-    "请输出中英对照。先给中文译文，再保留英文原文。格式保持简洁，适合论文精读。",
-  literal:
-    "请尽量贴近原文结构直译，同时保证中文可读。只输出译文，不要解释。",
-  natural:
-    "请以自然流畅的中文重述原文含义，适合快速阅读论文。只输出译文，不要解释。",
-  terminology:
+const MODE_INSTRUCTIONS: Record<TranslateMode, (targetLanguage: string) => string> = {
+  academic_zh: (targetLanguage) =>
+    `请将用户提供的原文翻译为准确、自然、适合${targetLanguage}学术阅读的${targetLanguage}。只输出译文，不要解释。`,
+  bilingual: (targetLanguage) =>
+    `请输出${targetLanguage}译文与原文对照。先给${targetLanguage}译文，再保留用户提供的原文。格式保持简洁，适合论文精读。`,
+  literal: (targetLanguage) =>
+    `请尽量贴近原文结构直译为${targetLanguage}，同时保证${targetLanguage}可读。只输出译文，不要解释。`,
+  natural: (targetLanguage) =>
+    `请以自然流畅的${targetLanguage}重述原文含义，适合快速阅读论文。只输出译文，不要解释。`,
+  terminology: (targetLanguage) =>
     [
-      "请解释原文中的关键学术术语，并给出推荐中文译名。",
+      `请解释原文中的关键学术术语，并给出推荐${targetLanguage}译名。`,
       "最多输出 8 条。",
       "不要使用 Markdown、标题、加粗、编号、项目符号或表格。",
       "不要输出开头说明、结尾总结或“推荐译法”等额外内容。",
-      "每行固定使用格式：英文术语：中文译名。说明：一句话解释。",
+      `每行固定使用格式：原文术语：${targetLanguage}译名。说明：用${targetLanguage}一句话解释。`,
       "没有关键术语时只输出：未发现需要解释的关键术语。"
     ].join("\n")
 };
 
-export function buildSystemPrompt(mode: TranslateMode, glossary?: Glossary): string {
+export function buildSystemPrompt(
+  mode: TranslateMode,
+  targetLanguage: string = DEFAULT_TARGET_LANGUAGE,
+  glossary?: Glossary
+): string {
+  const normalizedTargetLanguage = normalizeTargetLanguage(targetLanguage);
   const glossaryBlock = buildGlossaryBlock(glossary);
 
   return [
-    "你是专业的英文学术论文翻译助手。",
+    "你是专业的学术内容翻译助手。",
+    `自动识别用户提供的原文语言，并将其翻译为${normalizedTargetLanguage}。`,
+    "不要要求用户重新提供英文文本，也不要因为原文不是英文而拒绝翻译。",
     "保留公式、变量名、引用编号、专有名词。",
-    "必要时在中文译名后用括号保留英文术语。",
-    MODE_INSTRUCTIONS[mode],
+    `必要时在${normalizedTargetLanguage}译名后用括号保留原文术语。`,
+    MODE_INSTRUCTIONS[mode](normalizedTargetLanguage),
     glossaryBlock
   ]
     .filter(Boolean)

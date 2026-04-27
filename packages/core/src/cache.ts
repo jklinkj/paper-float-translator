@@ -1,8 +1,9 @@
-import type { DeepSeekModel, TranslateMode } from "./types";
+import { normalizeTargetLanguage, type DeepSeekModel, type TranslateMode } from "./types";
 
 export interface CacheKeyInput {
   model: DeepSeekModel;
   mode: TranslateMode;
+  targetLanguage: string;
   glossaryVersion: string;
   cleanedText: string;
 }
@@ -11,6 +12,7 @@ export async function createCacheKey(input: CacheKeyInput): Promise<string> {
   const payload = JSON.stringify({
     model: input.model,
     mode: input.mode,
+    targetLanguage: normalizeTargetLanguage(input.targetLanguage),
     glossaryVersion: input.glossaryVersion,
     cleanedText: input.cleanedText
   });

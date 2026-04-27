@@ -3,11 +3,29 @@ import { buildSystemPrompt, normalizeTerminologyOutput } from "./prompt";
 
 describe("buildSystemPrompt", () => {
   it("constrains terminology output to plain text lines", () => {
-    const prompt = buildSystemPrompt("terminology");
+    const prompt = buildSystemPrompt("terminology", "日文");
 
     expect(prompt).toContain("不要使用 Markdown");
-    expect(prompt).toContain("每行固定使用格式：英文术语：中文译名。说明：一句话解释。");
+    expect(prompt).toContain("每行固定使用格式：原文术语：日文译名。说明：用日文一句话解释。");
     expect(prompt).toContain("最多输出 8 条");
+  });
+
+  it("uses the requested target language for translation modes", () => {
+    const prompt = buildSystemPrompt("academic_zh", "法文");
+
+    expect(prompt).toContain("适合法文学术阅读的法文");
+    expect(prompt).not.toContain("适合中文学术阅读的中文");
+  });
+
+  it("does not assume the source language is English", () => {
+    const prompt = buildSystemPrompt("academic_zh", "日文");
+
+    expect(prompt).toContain("自动识别用户提供的原文语言");
+    expect(prompt).toContain("翻译为日文");
+    expect(prompt).toContain("不要要求用户重新提供英文文本");
+    expect(prompt).not.toContain("英文论文内容");
+    expect(prompt).not.toContain("英文原文");
+    expect(prompt).not.toContain("英文学术论文翻译助手");
   });
 });
 

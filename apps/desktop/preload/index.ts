@@ -1,14 +1,11 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { AppSettings, PopupState } from "@paper-float-translator/core";
+import type { AppSettings, PopupState, WatcherStatus } from "@paper-float-translator/core";
 
 export interface SettingsPayload {
   settings: AppSettings;
   hasApiKey: boolean;
-  doubleCopyStatus: {
-    available: boolean;
-    running: boolean;
-    message: string;
-  };
+  doubleCopyStatus: WatcherStatus;
+  selectionStatus: WatcherStatus;
 }
 
 export const api = {
@@ -18,11 +15,14 @@ export const api = {
     ipcRenderer.invoke("settings:saveApiKey", apiKey),
   clearCache: (): Promise<{ ok: true }> => ipcRenderer.invoke("settings:clearCache"),
   openSettings: (): Promise<void> => ipcRenderer.invoke("app:openSettings"),
+  openAccessibilitySettings: (): Promise<void> => ipcRenderer.invoke("app:openAccessibilitySettings"),
   copyTranslation: (): Promise<void> => ipcRenderer.invoke("popup:copyTranslation"),
+  copySource: (): Promise<void> => ipcRenderer.invoke("popup:copySource"),
   closePopup: (): Promise<void> => ipcRenderer.invoke("popup:close"),
   togglePin: (): Promise<void> => ipcRenderer.invoke("popup:togglePin"),
-  retryTranslation: (): Promise<void> => ipcRenderer.invoke("popup:retry"),
-  explainTerms: (): Promise<void> => ipcRenderer.invoke("popup:explainTerms"),
+  translateSelection: (): Promise<void> => ipcRenderer.invoke("popup:translateSelection"),
+  retryTranslation: (targetLanguage?: string): Promise<void> => ipcRenderer.invoke("popup:retry", targetLanguage),
+  explainTerms: (targetLanguage?: string): Promise<void> => ipcRenderer.invoke("popup:explainTerms", targetLanguage),
   resizePopup: (height: number): Promise<void> => ipcRenderer.invoke("popup:resize", height),
   openExternal: (url: string): Promise<void> => ipcRenderer.invoke("shell:openExternal", url),
   onPopupState: (callback: (state: PopupState) => void): (() => void) => {

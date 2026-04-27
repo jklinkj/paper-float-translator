@@ -13,7 +13,8 @@ import {
   DEFAULT_SETTINGS,
   type AppSettings,
   type DeepSeekModel,
-  type TranslateMode
+  type TranslateMode,
+  type WatcherStatus
 } from "@paper-float-translator/core";
 
 const MODEL_OPTIONS: Array<{ value: DeepSeekModel; label: string }> = [
@@ -22,19 +23,31 @@ const MODEL_OPTIONS: Array<{ value: DeepSeekModel; label: string }> = [
 ];
 
 const MODE_OPTIONS: Array<{ value: TranslateMode; label: string }> = [
-  { value: "academic_zh", label: "学术中文" },
-  { value: "bilingual", label: "中英对照" },
+  { value: "academic_zh", label: "学术翻译" },
+  { value: "bilingual", label: "双语对照" },
   { value: "literal", label: "直译" },
   { value: "natural", label: "意译" },
   { value: "terminology", label: "解释术语" }
 ];
+
+const LANGUAGE_OPTIONS = ["中文", "英文", "日文", "韩文", "法文", "德文", "西班牙文"];
+const CUSTOM_LANGUAGE_VALUE = "__custom__";
 
 export function SettingsView(): JSX.Element {
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [popupWidthInput, setPopupWidthInput] = useState(String(DEFAULT_SETTINGS.popupWidth));
   const [apiKey, setApiKey] = useState("");
   const [hasApiKey, setHasApiKey] = useState(false);
-  const [doubleCopyStatus, setDoubleCopyStatus] = useState({ available: true, running: false, message: "" });
+  const [doubleCopyStatus, setDoubleCopyStatus] = useState<WatcherStatus>({
+    available: true,
+    running: false,
+    message: ""
+  });
+  const [selectionStatus, setSelectionStatus] = useState<WatcherStatus>({
+    available: true,
+    running: false,
+    message: ""
+  });
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -54,6 +67,7 @@ export function SettingsView(): JSX.Element {
         setPopupWidthInput(String(payload.settings.popupWidth));
         setHasApiKey(payload.hasApiKey);
         setDoubleCopyStatus(payload.doubleCopyStatus);
+        setSelectionStatus(payload.selectionStatus);
       })
       .catch((loadError: unknown) => {
         setError(loadError instanceof Error ? loadError.message : "读取设置失败。");
@@ -99,6 +113,7 @@ export function SettingsView(): JSX.Element {
       const refreshed = await window.paperFloatTranslator.getSettings();
       setHasApiKey(refreshed.hasApiKey);
       setDoubleCopyStatus(refreshed.doubleCopyStatus);
+      setSelectionStatus(refreshed.selectionStatus);
       setNotice("设置已保存。");
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : "保存设置失败。");
@@ -139,6 +154,13 @@ export function SettingsView(): JSX.Element {
     }
   }
 
+  const selectionStatusMessage = settings.enableSelectionPopup
+    ? selectionStatus.message || "自动选区监听状态未知。"
+    : "拖选浮窗已关闭，仍可使用 Cmd+C+C。";
+  const settingsLanguageSelectValue = LANGUAGE_OPTIONS.includes(settings.targetLanguage)
+    ? settings.targetLanguage
+    : CUSTOM_LANGUAGE_VALUE;
+
   if (loading) {
     return (
       <main className="settings-page centered">
@@ -153,7 +175,7 @@ export function SettingsView(): JSX.Element {
       <header className="settings-header">
         <div>
           <h1>Paper Float Translator</h1>
-          <p>选中文本后快速按两次 Cmd+C，在鼠标附近显示论文翻译浮窗。</p>
+          <p>选中文本后自动显示操作浮窗；不支持自动取词的场景可继续快速按两次 Cmd+C。</p>
         </div>
         <button
           className="icon-link"
@@ -209,6 +231,35 @@ export function SettingsView(): JSX.Element {
               ))}
             </select>
           </label>
+
+          <label className="field">
+            <span>默认目标语言</span>
+            <select
+              value={settingsLanguageSelectValue}
+              onChange={(event) => {
+                const nextLanguage = event.target.value;
+                setSettings({
+                  ...settings,
+                  targetLanguage: nextLanguage === CUSTOM_LANGUAGE_VALUE ? "" : nextLanguage
+                });
+              }}
+            >
+              {LANGUAGE_OPTIONS.map((language) => (
+                <option key={language} value={language}>
+                  {language}
+                </option>
+              ))}
+              <option value={CUSTOM_LANGUAGE_VALUE}>自定义...</option>
+            </select>
+            {settingsLanguageSelectValue === CUSTOM_LANGUAGE_VALUE ? (
+              <input
+                value={settings.targetLanguage}
+                placeholder="输入目标语言，例如 俄文"
+                onChange={(event) => setSettings({ ...settings, targetLanguage: event.target.value })}
+              />
+            ) : null}
+            <small>拖选翻译和 Cmd+C+C 会直接使用这个语言。</small>
+          </label>
         </div>
 
         <div className="panel">
@@ -217,8 +268,33 @@ export function SettingsView(): JSX.Element {
             <h2>桌面行为</h2>
           </div>
 
+          <label className="switch-row">
+            <input
+              type="checkbox"
+              checked={settings.enableSelectionPopup}
+              onChange={(event) => setSettings({ ...settings, enableSelectionPopup: event.target.checked })}
+            />
+            <span>拖选后显示操作浮窗</span>
+          </label>
+
           <label className="field">
-            <span>取词方式</span>
+            <span>自动选区浮窗</span>
+            <input value={settings.enableSelectionPopup ? "选中文本后显示按钮浮窗" : "已关闭"} readOnly />
+            <small>{selectionStatusMessage}</small>
+            {settings.enableSelectionPopup && !selectionStatus.available ? (
+              <button
+                type="button"
+                className="inline-action"
+                onClick={() => window.paperFloatTranslator.openAccessibilitySettings()}
+              >
+                <ExternalLink size={14} />
+                打开辅助功能权限
+              </button>
+            ) : null}
+          </label>
+
+          <label className="field">
+            <span>兜底触发</span>
             <input value="快速按两次 Cmd+C" readOnly />
             <small>{doubleCopyStatus.message || "双复制监听状态未知。"}</small>
           </label>

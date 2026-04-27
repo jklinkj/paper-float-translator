@@ -18,7 +18,8 @@ describe("DeepSeekClient", () => {
     const result = await client.translate({
       text: "This is a paper.",
       model: "deepseek-v4-flash",
-      mode: "academic_zh"
+      mode: "academic_zh",
+      targetLanguage: "中文"
     });
 
     expect(result.translation).toBe("译文");
@@ -27,6 +28,32 @@ describe("DeepSeekClient", () => {
       thinking: { type: "disabled" },
       stream: false
     });
+  });
+
+  it("builds the system prompt with target language and no English source requirement", async () => {
+    let requestBody: { messages?: Array<{ role: string; content: string }> } | undefined;
+    const fetchImpl = async (_url: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      requestBody = JSON.parse(String(init?.body));
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { role: "assistant", content: "翻訳" } }]
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    };
+
+    const client = new DeepSeekClient({ apiKey: "test-key", fetchImpl });
+    await client.translate({
+      text: "这是一段中文内容。",
+      model: "deepseek-v4-flash",
+      mode: "academic_zh",
+      targetLanguage: "日文"
+    });
+
+    expect(requestBody?.messages?.[0]?.content).toContain("自动识别用户提供的原文语言");
+    expect(requestBody?.messages?.[0]?.content).toContain("翻译为日文");
+    expect(requestBody?.messages?.[0]?.content).not.toContain("英文论文内容");
+    expect(requestBody?.messages?.[0]?.content).not.toContain("请提供英文");
   });
 
   it("maps auth errors to readable errors", async () => {
@@ -40,7 +67,8 @@ describe("DeepSeekClient", () => {
       client.translate({
         text: "hello",
         model: "deepseek-v4-flash",
-        mode: "academic_zh"
+        mode: "academic_zh",
+        targetLanguage: "中文"
       })
     ).rejects.toBeInstanceOf(DeepSeekApiError);
   });
@@ -66,7 +94,8 @@ describe("DeepSeekClient", () => {
     const result = await client.translate({
       text: "baseline",
       model: "deepseek-v4-flash",
-      mode: "terminology"
+      mode: "terminology",
+      targetLanguage: "中文"
     });
 
     expect(result.translation).toBe("baseline：基线模型。说明：指研究中的参照框架。");
@@ -86,7 +115,8 @@ describe("DeepSeekClient", () => {
     const result = await client.translate({
       text: "This is a paper.",
       model: "deepseek-v4-flash",
-      mode: "academic_zh"
+      mode: "academic_zh",
+      targetLanguage: "中文"
     });
 
     expect(result.translation).toBe("**译文**");

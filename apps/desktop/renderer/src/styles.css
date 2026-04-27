@@ -155,6 +155,23 @@ button:disabled {
   box-shadow: 0 0 0 3px rgb(50 120 168 / 0.15);
 }
 
+.inline-action {
+  width: fit-content;
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 7px;
+  padding: 0 10px;
+  background: #e8edf2;
+  color: #26343f;
+  font-size: 12px;
+}
+
+.inline-action:hover {
+  background: #dce5ed;
+}
+
 .switch-row {
   display: flex;
   align-items: center;
@@ -230,6 +247,12 @@ button:disabled {
   border-radius: 8px;
   background: #ffffff;
   box-shadow: 0 16px 40px rgb(17 24 31 / 0.18);
+}
+
+.selection-shell {
+  justify-content: center;
+  min-height: 56px;
+  border-radius: 8px;
 }
 
 .popup-header {
@@ -327,11 +350,59 @@ button:disabled {
 
 .popup-actions {
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   justify-content: flex-end;
   gap: 8px;
   padding: 10px 12px;
   border-top: 1px solid #e1e7ee;
   background: #fbfcfd;
+}
+
+.selection-actions {
+  flex-wrap: nowrap;
+  justify-content: center;
+  padding: 10px;
+  border-top: 0;
+  background: #ffffff;
+}
+
+.target-language-control {
+  flex: 1 1 150px;
+  min-width: 138px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: auto;
+  color: #5f6b76;
+  font-size: 12px;
+}
+
+.target-language-control select,
+.target-language-control input {
+  min-width: 72px;
+  max-width: 150px;
+  height: 32px;
+  flex: 1;
+  border: 1px solid #cbd5df;
+  border-radius: 7px;
+  padding: 0 9px;
+  color: #1f2a33;
+  background: #ffffff;
+}
+
+.target-language-control select {
+  max-width: 108px;
+}
+
+.target-language-control input:focus {
+  border-color: #55738b;
+  outline: 2px solid rgb(85 115 139 / 0.16);
+}
+
+.target-language-control select:focus {
+  border-color: #55738b;
+  outline: 2px solid rgb(85 115 139 / 0.16);
 }
 
 .popup-actions button {
@@ -343,6 +414,15 @@ button:disabled {
 
 .popup-actions button:hover:not(:disabled) {
   background: #dce5ed;
+}
+
+.popup-actions button.primary-action {
+  background: #234158;
+  color: #ffffff;
+}
+
+.popup-actions button.primary-action:hover:not(:disabled) {
+  background: #1b3448;
 }
 
 @media (max-width: 720px) {

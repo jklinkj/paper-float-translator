@@ -21,7 +21,9 @@ describe("JsonSettingsStore", () => {
 
     await expect(store.load()).resolves.toMatchObject({
       model: "deepseek-v4-flash",
-      cleanPdfText: true
+      cleanPdfText: true,
+      enableSelectionPopup: true,
+      targetLanguage: "中文"
     });
   });
 
@@ -41,6 +43,8 @@ describe("JsonSettingsStore", () => {
     expect(settings).not.toHaveProperty("shortcut");
     expect(settings).not.toHaveProperty("triggerMode");
     expect(settings).not.toHaveProperty("doubleCopyWindowMs");
+    expect(settings.enableSelectionPopup).toBe(true);
+    expect(settings.targetLanguage).toBe("中文");
   });
 
   it("saves normalized settings", async () => {
@@ -58,6 +62,37 @@ describe("JsonSettingsStore", () => {
     expect(settings.popupWidth).toBe(520);
   });
 
+  it("defaults selection popup toggle to enabled for old settings files", async () => {
+    const store = new JsonSettingsStore(join(dir, "settings.json"));
+    const settings = await store.save({
+      model: "deepseek-v4-flash",
+      mode: "academic_zh",
+      cleanPdfText: true,
+      enableCache: true,
+      popupWidth: 420
+    } as unknown as Awaited<ReturnType<JsonSettingsStore["load"]>>);
+
+    expect(settings.enableSelectionPopup).toBe(true);
+  });
+
+  it("persists disabled selection popup setting", async () => {
+    const store = new JsonSettingsStore(join(dir, "settings.json"));
+    const saved = await store.update({ enableSelectionPopup: false });
+    const loaded = await store.load();
+
+    expect(saved.enableSelectionPopup).toBe(false);
+    expect(loaded.enableSelectionPopup).toBe(false);
+  });
+
+  it("normalizes and persists target language", async () => {
+    const store = new JsonSettingsStore(join(dir, "settings.json"));
+    const saved = await store.update({ targetLanguage: "  日文\n " });
+    const loaded = await store.load();
+
+    expect(saved.targetLanguage).toBe("日文");
+    expect(loaded.targetLanguage).toBe("日文");
+  });
+
 });
 
 describe("JsonCacheStore", () => {
@@ -69,6 +104,7 @@ describe("JsonCacheStore", () => {
       translation: "你好",
       model: "deepseek-v4-flash",
       mode: "academic_zh",
+      targetLanguage: "中文",
       glossaryVersion: "v1",
       createdAt: "2026-04-27T00:00:00.000Z"
     });
