@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "jsx": "react-jsx",
+    "types": ["node", "vite/client", "react", "react-dom"],
+    "tsBuildInfoFile": "node_modules/.cache/tsconfig.tsbuildinfo"
+  },
+  "references": [
+    { "path": "../../packages/core" },
+    { "path": "../../packages/deepseek" },
+    { "path": "../../packages/storage" }
+  ],
+  "include": ["electron", "preload", "renderer", "electron.vite.config.ts"]
+}
