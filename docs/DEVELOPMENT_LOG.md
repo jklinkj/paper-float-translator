@@ -63,3 +63,27 @@
 - 如需启动桌面开发版，需要在网络可用时运行 `npm rebuild electron` 或普通 `npm install`。
 - macOS 上模拟复制需要给运行进程授予辅助功能权限。
 - Linux 分支依赖 `xdotool`，Windows 分支使用 PowerShell SendKeys，后续需要真实平台验证。
+
+### Mac Runtime Bring-Up
+
+完成 macOS 本机运行环境打通和第一轮真实桌面验证。
+
+主要内容：
+
+- 使用 Electron 镜像完成 `npm rebuild electron`，解决 GitHub 下载 Electron 二进制连接失败的问题。
+- 确认 `node -e "console.log(require('electron'))"` 能返回 macOS Electron 可执行文件路径。
+- 启动 `npm run dev`，确认设置页能在 Electron 窗口中真实渲染。
+- 使用 Computer Use 打开 TextEdit，创建并选中英文测试句子。
+- 发现当前系统未授予自动按键所需的 macOS 辅助功能权限，`osascript` 不能发送按键。
+- 在 Electron main process 中增加 macOS 辅助功能权限预检，未授权时直接在浮窗中显示明确处理路径。
+- 在应用菜单中增加 `Translate Selection` 入口，方便开发期触发同一条翻译链路。
+
+本轮验证结果：
+
+- Electron 二进制安装成功。
+- `npm run dev` 可以启动桌面 App。
+- 设置页渲染正常。
+- TextEdit 外部选区可由 Computer Use 创建和选中。
+- 当前机器需要手动授予辅助功能权限后，才能完成模拟 `Cmd+C` 和全局快捷键端到端验证。
+- 浮窗窗口已由人工确认可见。
+- 菜单入口 `Translate Selection` 已验证会触发翻译链路并创建可见浮窗。

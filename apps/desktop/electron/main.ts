@@ -13,6 +13,7 @@ import {
   safeStorage,
   screen,
   shell,
+  systemPreferences,
   type BrowserWindowConstructorOptions,
   type NativeImage,
   type Point
@@ -93,6 +94,11 @@ function setupApplicationMenu(): void {
       {
         label: "Paper Float Translator",
         submenu: [
+          {
+            label: "Translate Selection",
+            click: () => void handleTranslateShortcut()
+          },
+          { type: "separator" },
           {
             label: "Settings",
             accelerator: "CommandOrControl+,",
@@ -209,6 +215,7 @@ function registerTranslationShortcut(): void {
 }
 
 async function handleTranslateShortcut(): Promise<void> {
+  devLog("Translate selection requested.");
   lastCursorPoint = screen.getCursorScreenPoint();
   await showPopup({
     status: "loading",
@@ -221,6 +228,17 @@ async function handleTranslateShortcut(): Promise<void> {
   });
 
   try {
+    if (!hasRequiredAccessibilityPermission()) {
+      updatePopupState({
+        status: "error",
+        pinned: currentPopupState.pinned,
+        error: buildAccessibilityPermissionMessage(),
+        sourceText: "",
+        cleanedText: ""
+      });
+      return;
+    }
+
     const selectedText = await readSelectedTextFromClipboardCopy();
     const cleanedText = cleanSelectedText(selectedText, { enabled: settings.cleanPdfText });
 
@@ -452,12 +470,6 @@ async function ensurePopupWindow(): Promise<BrowserWindow> {
 
   popupWindow.setAlwaysOnTop(true, "floating");
 
-  popupWindow.on("blur", () => {
-    if (!currentPopupState.pinned) {
-      popupWindow?.hide();
-    }
-  });
-
   popupWindow.on("closed", () => {
     popupWindow = null;
   });
@@ -476,11 +488,18 @@ async function showPopup(state: PopupState): Promise<void> {
   const [width, height] = popup.getSize();
   positionPopup(lastCursorPoint ?? screen.getCursorScreenPoint(), width, height);
   popup.showInactive();
+  popup.moveTop();
+  devLog("Popup shown.", { visible: popup.isVisible(), bounds: popup.getBounds() });
   sendPopupState();
 }
 
 function updatePopupState(state: PopupState): void {
   currentPopupState = state;
+  devLog("Popup state updated.", {
+    status: state.status,
+    cached: state.cached,
+    error: state.error ? state.error.slice(0, 120) : undefined
+  });
   sendPopupState();
 }
 
@@ -560,6 +579,34 @@ function toUserMessage(error: unknown): string {
   }
 
   return "发生未知错误。";
+}
+
+function devLog(message: string, metadata?: unknown): void {
+  if (app.isPackaged) {
+    return;
+  }
+
+  if (metadata === undefined) {
+    console.info(message);
+    return;
+  }
+
+  console.info(message, metadata);
+}
+
+function hasRequiredAccessibilityPermission(): boolean {
+  if (process.platform !== "darwin") {
+    return true;
+  }
+
+  return systemPreferences.isTrustedAccessibilityClient(false);
+}
+
+function buildAccessibilityPermissionMessage(): string {
+  return [
+    "需要授予 macOS 辅助功能权限后，才能复制其他 App 中的选中文本。",
+    "请打开 System Settings -> Privacy & Security -> Accessibility，允许 Electron、Terminal/Codex 或最终打包后的 Paper Float Translator，然后重启应用。"
+  ].join(" ");
 }
 
 class ResilientSecretStore implements SecretStore {
