@@ -7,7 +7,7 @@ import {
 } from "@paper-float-translator/core";
 import { readJsonFile, writeJsonFile } from "./file-utils";
 
-const MODE_VALUES: TranslateMode[] = ["academic_zh", "bilingual", "literal", "natural", "terminology"];
+const MODE_VALUES: TranslateMode[] = ["academic_zh", "bilingual", "terminology"];
 const MODEL_VALUES: DeepSeekModel[] = ["deepseek-v4-flash", "deepseek-v4-pro"];
 
 export class JsonSettingsStore {

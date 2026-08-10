@@ -9,8 +9,6 @@ export type DeepSeekModel =
 export type TranslateMode =
   | "academic_zh"
   | "bilingual"
-  | "literal"
-  | "natural"
   | "terminology";
 
 export type Glossary = Record<string, string>;
@@ -49,24 +47,303 @@ export const DEFAULT_SETTINGS: AppSettings = {
   popupWidth: 420
 };
 
-export type PopupStatus = "idle" | "selection" | "loading" | "success" | "error";
+export const POPUP_PROTOCOL_VERSION = 1 as const;
+
+export type PopupStatus =
+  | "hidden"
+  | "selection_pending"
+  | "selection_ready"
+  | "translating"
+  | "translated"
+  | "error";
+
+export type PopupErrorKind =
+  | "configuration"
+  | "permission"
+  | "selection"
+  | "translation"
+  | "protocol"
+  | "unknown";
+
+export type PopupRecoveryAction =
+  | "retry_translation"
+  | "open_settings"
+  | "open_accessibility"
+  | "open_input_monitoring"
+  | "reselect";
 
 export interface PopupState {
+  protocolVersion: typeof POPUP_PROTOCOL_VERSION;
+  revision: number;
+  selectionRevision: number;
+  visible: boolean;
   status: PopupStatus;
   sourceText?: string;
   selectedText?: string;
   cleanedText?: string;
   translation?: string;
   error?: string;
+  errorKind?: PopupErrorKind;
+  retryable?: boolean;
+  recoveryAction?: PopupRecoveryAction;
   cached?: boolean;
   targetLanguage?: string;
   pinned: boolean;
+}
+
+export const HIDDEN_POPUP_STATE: PopupState = {
+  protocolVersion: POPUP_PROTOCOL_VERSION,
+  revision: 0,
+  selectionRevision: 0,
+  visible: false,
+  status: "hidden",
+  pinned: false
+};
+
+/**
+ * Merge a snapshot or event into the renderer's last accepted state. Events may
+ * arrive before the post-subscription snapshot, so only a strictly newer
+ * revision is allowed to replace an existing state.
+ */
+export function reconcilePopupState(current: PopupState | null, incoming: PopupState): PopupState {
+  assertPopupProtocol(incoming);
+  if (current && incoming.revision <= current.revision) {
+    return current;
+  }
+  return incoming;
+}
+
+export function assertPopupProtocol(state: PopupState): void {
+  if (state.protocolVersion !== POPUP_PROTOCOL_VERSION) {
+    throw new Error(
+      `Unsupported popup protocol version ${String(state.protocolVersion)}; expected ${POPUP_PROTOCOL_VERSION}.`
+    );
+  }
+  if (!Number.isSafeInteger(state.revision) || state.revision < 0) {
+    throw new Error(`Invalid popup revision ${String(state.revision)}.`);
+  }
+  if (!Number.isSafeInteger(state.selectionRevision) || state.selectionRevision < 0) {
+    throw new Error(`Invalid selection revision ${String(state.selectionRevision)}.`);
+  }
+  const statuses: readonly PopupStatus[] = [
+    "hidden",
+    "selection_pending",
+    "selection_ready",
+    "translating",
+    "translated",
+    "error"
+  ];
+  if (!statuses.includes(state.status)) {
+    throw new Error(`Invalid popup status ${String(state.status)}.`);
+  }
+  if (state.visible !== (state.status !== "hidden")) {
+    throw new Error(`Popup visibility does not match status ${state.status}.`);
+  }
+  if (state.status === "error") {
+    const recoveryActions: readonly PopupRecoveryAction[] = [
+      "retry_translation",
+      "open_settings",
+      "open_accessibility",
+      "open_input_monitoring",
+      "reselect"
+    ];
+    if (!state.error?.trim() || !state.errorKind || typeof state.retryable !== "boolean") {
+      throw new Error("Popup error state is missing typed error metadata.");
+    }
+    if (!state.recoveryAction || !recoveryActions.includes(state.recoveryAction)) {
+      throw new Error(`Invalid popup recovery action ${String(state.recoveryAction)}.`);
+    }
+    if (state.retryable !== (state.recoveryAction === "retry_translation")) {
+      throw new Error("Popup retryability does not match its recovery action.");
+    }
+    if (state.errorKind === "configuration" && state.recoveryAction !== "open_settings") {
+      throw new Error("Configuration errors must open settings.");
+    }
+    if (
+      state.errorKind === "permission" &&
+      state.recoveryAction !== "open_accessibility" &&
+      state.recoveryAction !== "open_input_monitoring"
+    ) {
+      throw new Error("Permission errors must identify the exact System Settings pane.");
+    }
+    if (state.errorKind === "selection" && state.recoveryAction !== "reselect") {
+      throw new Error("Selection errors must ask for a new selection.");
+    }
+    if (state.errorKind === "translation" && state.recoveryAction !== "retry_translation") {
+      throw new Error("Translation errors must offer a retry.");
+    }
+  }
 }
 
 export interface WatcherStatus {
   available: boolean;
   running: boolean;
   message: string;
+  code?: string;
+}
+
+export type PermissionGrant = "granted" | "denied" | "unknown" | "unsupported";
+
+export type CapabilityHealth = "ready" | "degraded" | "disabled" | "unavailable" | "unknown";
+
+export interface PermissionCapabilityState {
+  grant: PermissionGrant;
+  health: CapabilityHealth;
+  statusCode?: string;
+}
+
+export interface RuntimeCapabilityState {
+  health: CapabilityHealth;
+  statusCode?: string;
+}
+
+/**
+ * A point-in-time view of macOS grants and the independent runtime sources that
+ * implement selection and Cmd+C+C. Permissions intentionally do not imply that
+ * an event tap or AX observer is healthy.
+ */
+export interface CapabilitySnapshot {
+  accessibility: PermissionCapabilityState;
+  listenEvent: PermissionCapabilityState;
+  mouseTap: RuntimeCapabilityState;
+  keyTap: RuntimeCapabilityState;
+  axSelectedTextObserver: RuntimeCapabilityState;
+  directSelectionRead: RuntimeCapabilityState;
+  clipboardDoubleCopyFallback: RuntimeCapabilityState;
+}
+
+export type CapabilityPermissionAction = "open_accessibility_settings" | "open_input_monitoring_settings";
+
+export interface CapabilityPresentation {
+  value: string;
+  tone: "ok" | "warning" | "neutral";
+  detail: string;
+}
+
+export const UNKNOWN_CAPABILITY_SNAPSHOT: CapabilitySnapshot = {
+  accessibility: { grant: "unknown", health: "unknown" },
+  listenEvent: { grant: "unknown", health: "unknown" },
+  mouseTap: { health: "unknown" },
+  keyTap: { health: "unknown" },
+  axSelectedTextObserver: { health: "unknown" },
+  directSelectionRead: { health: "unknown" },
+  clipboardDoubleCopyFallback: { health: "unknown" }
+};
+
+export function getCapabilityPermissionActions(snapshot: CapabilitySnapshot): CapabilityPermissionAction[] {
+  const actions: CapabilityPermissionAction[] = [];
+
+  if (snapshot.accessibility.grant === "denied") {
+    actions.push("open_accessibility_settings");
+  }
+  if (snapshot.listenEvent.grant === "denied") {
+    actions.push("open_input_monitoring_settings");
+  }
+
+  return actions;
+}
+
+export function getSelectionCapabilityPresentation(snapshot: CapabilitySnapshot): CapabilityPresentation {
+  const directReadReady = snapshot.directSelectionRead.health === "ready";
+  const mouseReady = snapshot.mouseTap.health === "ready";
+  const observerReady = snapshot.axSelectedTextObserver.health === "ready";
+
+  if (directReadReady && mouseReady && observerReady) {
+    return {
+      value: "完整可用",
+      tone: "ok",
+      detail: "鼠标选区与辅助功能选区通知均已就绪。"
+    };
+  }
+
+  if (
+    directReadReady &&
+    mouseReady &&
+    snapshot.axSelectedTextObserver.health === "degraded" &&
+    snapshot.axSelectedTextObserver.statusCode === "selection_mouse_ready_ax_observer_limited"
+  ) {
+    return {
+      value: "划词就绪",
+      tone: "ok",
+      detail: "鼠标划词与直接读取已就绪；切换到文档后会自动重新绑定 AX 选区通知。"
+    };
+  }
+
+  if (directReadReady && (mouseReady || observerReady)) {
+    return {
+      value: "降级可用",
+      tone: "warning",
+      detail: mouseReady
+        ? "鼠标选区可用，AX selectedText 通知当前受限。"
+        : "AX selectedText 通知可用，鼠标事件监听当前受限。"
+    };
+  }
+
+  if (snapshot.keyTap.health === "ready" || snapshot.clipboardDoubleCopyFallback.health === "ready") {
+    return {
+      value: "Cmd+C+C 可用",
+      tone: "warning",
+      detail:
+        snapshot.keyTap.health === "ready"
+          ? "自动选区路径当前不可用，Cmd+C+C 按键监听仍可使用。"
+          : "自动选区路径当前不可用，可使用 Cmd+C+C 剪贴板回退。"
+    };
+  }
+
+  const unknown = [
+    snapshot.mouseTap.health,
+    snapshot.axSelectedTextObserver.health,
+    snapshot.directSelectionRead.health
+  ].some((health) => health === "unknown");
+
+  return unknown
+    ? {
+        value: "状态未知",
+        tone: "warning",
+        detail: "尚未收到完整的原生能力状态，请刷新诊断。"
+      }
+    : {
+        value: "不可用",
+        tone: "warning",
+        detail: "自动选区与剪贴板回退当前均不可用。"
+      };
+}
+
+export function getDoubleCopyCapabilityPresentation(snapshot: CapabilitySnapshot): CapabilityPresentation {
+  if (snapshot.keyTap.health === "ready") {
+    return {
+      value: "按键监听可用",
+      tone: "ok",
+      detail: "Cmd+C+C 按键监听已就绪；剪贴板轮询回退当前无需启用。"
+    };
+  }
+
+  switch (snapshot.clipboardDoubleCopyFallback.health) {
+    case "ready":
+      return {
+        value: "回退可用",
+        tone: "ok",
+        detail: "剪贴板双复制回退已就绪。"
+      };
+    case "degraded":
+      return {
+        value: "需再次复制",
+        tone: "warning",
+        detail: "一次轮询跨过了多个剪贴板版本，无法证明发生了两次相同复制；请重新按两次 Cmd+C。"
+      };
+    case "unknown":
+      return {
+        value: "状态未知",
+        tone: "warning",
+        detail: "尚未收到剪贴板回退能力状态。"
+      };
+    default:
+      return {
+        value: "不可用",
+        tone: "warning",
+        detail: "剪贴板双复制回退当前不可用。"
+      };
+  }
 }
 
 export interface CacheEntry {

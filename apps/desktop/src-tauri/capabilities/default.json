@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default permissions for Paper Float Translator",
+  "windows": ["settings", "popup"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-outer-position",
+    "core:window:allow-set-position",
+    "core:window:allow-show",
+    "core:window:allow-start-dragging"
+  ]
+}

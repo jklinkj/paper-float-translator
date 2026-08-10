@@ -1,0 +1,22 @@
+Paper Float TextEdit Selection Baseline v1
+
+Drag target: Quartz rivers carry patient light across the valley.
+
+Double-click target: orbit
+
+Triple-click target: This entire paragraph is the fixed triple-click selection target.
+
+Shift-extend target: amber cobalt delta ember
+
+Keyboard target: Silent revisions protect the newest selection.
+
+Repeated target at position A: repeatable phrase
+Repeated target at position B: repeatable phrase
+
+Race target A: FIRST_SELECTION_MUST_NOT_WIN
+Race target B: SECOND_SELECTION_MUST_WIN
+
+Unicode target: 研究者用 emoji 🧭 校验可靠性与换行。
+RTL target: مرحبا بالعالم — selection remains bounded.
+
+Fixture ID: paper-float-textedit-selection-baseline-v1

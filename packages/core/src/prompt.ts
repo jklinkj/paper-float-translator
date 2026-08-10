@@ -5,10 +5,6 @@ const MODE_INSTRUCTIONS: Record<TranslateMode, (targetLanguage: string) => strin
     `请将用户提供的原文翻译为准确、自然、适合${targetLanguage}学术阅读的${targetLanguage}。只输出译文，不要解释。`,
   bilingual: (targetLanguage) =>
     `请输出${targetLanguage}译文与原文对照。先给${targetLanguage}译文，再保留用户提供的原文。格式保持简洁，适合论文精读。`,
-  literal: (targetLanguage) =>
-    `请尽量贴近原文结构直译为${targetLanguage}，同时保证${targetLanguage}可读。只输出译文，不要解释。`,
-  natural: (targetLanguage) =>
-    `请以自然流畅的${targetLanguage}重述原文含义，适合快速阅读论文。只输出译文，不要解释。`,
   terminology: (targetLanguage) =>
     [
       `请解释原文中的关键学术术语，并给出推荐${targetLanguage}译名。`,

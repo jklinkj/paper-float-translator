@@ -9,3 +9,8 @@ out
 API KEY.md
 coverage
 *.tsbuildinfo
+.playwright-cli/
+output/playwright/
+playwright-report/
+test-results/
+tmp/

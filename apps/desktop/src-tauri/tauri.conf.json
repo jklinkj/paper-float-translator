@@ -1,0 +1,70 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Paper Float Translator",
+  "version": "0.1.0",
+  "identifier": "com.paperfloat.translator",
+  "build": {
+    "beforeDevCommand": "npm run dev:renderer",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build:renderer",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "settings",
+        "title": "Paper Float Translator",
+        "url": "index.html",
+        "width": 860,
+        "height": 720,
+        "resizable": true,
+        "visible": true
+      },
+      {
+        "label": "popup",
+        "title": "Paper Float Translator",
+        "url": "index.html?view=popup",
+        "width": 440,
+        "height": 66,
+        "resizable": false,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "publisher": "Paper Float Translator",
+    "copyright": "Copyright © 2026 Paper Float Translator",
+    "license": "LicenseRef-Proprietary",
+    "category": "Productivity",
+    "shortDescription": "A macOS floating translator for paper reading.",
+    "longDescription": "Paper Float Translator is a macOS-first desktop translator that shows lightweight translation actions near selected text and uses Cmd+C+C as a fallback trigger.",
+    "icon": ["icons/icon.png", "icons/icon.icns"],
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "hardenedRuntime": true,
+      "entitlements": "entitlements.plist",
+      "dmg": {
+        "appPosition": {
+          "x": 180,
+          "y": 170
+        },
+        "applicationFolderPosition": {
+          "x": 480,
+          "y": 170
+        },
+        "windowSize": {
+          "width": 660,
+          "height": 400
+        }
+      }
+    }
+  }
+}

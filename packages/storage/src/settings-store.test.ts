@@ -93,6 +93,21 @@ describe("JsonSettingsStore", () => {
     expect(loaded.targetLanguage).toBe("日文");
   });
 
+  it("maps removed translation modes to academic translation", async () => {
+    const store = new JsonSettingsStore(join(dir, "settings.json"));
+    const settings = await store.save({
+      model: "deepseek-v4-flash",
+      mode: "literal",
+      cleanPdfText: true,
+      enableCache: true,
+      enableSelectionPopup: true,
+      targetLanguage: "中文",
+      popupWidth: 420
+    } as unknown as Awaited<ReturnType<JsonSettingsStore["load"]>>);
+
+    expect(settings.mode).toBe("academic_zh");
+  });
+
 });
 
 describe("JsonCacheStore", () => {
