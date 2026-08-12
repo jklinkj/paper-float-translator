@@ -2349,18 +2349,10 @@ fn atomic_write(path: &Path, content: &[u8]) -> Result<(), AcceptanceRuntimeErro
     })?;
     fs::create_dir_all(parent)
         .map_err(|error| AcceptanceRuntimeError::Export(error.to_string()))?;
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or(ACCEPTANCE_EXPORT_FILE);
-    let sequence = EXPORT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temporary_path = parent.join(format!(
-        ".{file_name}.tmp-{}-{sequence}",
-        std::process::id()
-    ));
-    atomic_write_with_temporary_path(path, &temporary_path, content)
+    crate::write_atomic_contents(path, content).map_err(AcceptanceRuntimeError::Export)
 }
 
+#[cfg(test)]
 fn atomic_write_with_temporary_path(
     path: &Path,
     temporary_path: &Path,

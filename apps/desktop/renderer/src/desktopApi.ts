@@ -45,6 +45,7 @@ export interface SettingsPayload {
   hasApiKey: boolean;
   apiKeyStatus: ApiKeyStatus;
   apiKeyStorage: ApiKeyStorage;
+  runtimePlatform: RuntimePlatform;
   doubleCopyStatus: WatcherStatus;
   selectionStatus: WatcherStatus;
   capabilitySnapshot: CapabilitySnapshot;
@@ -53,7 +54,8 @@ export interface SettingsPayload {
 }
 
 export type ApiKeyStatus = "configured" | "missing" | "unavailable";
-export type ApiKeyStorage = "local_file" | "system_keychain";
+export type ApiKeyStorage = "local_file" | "system_keychain" | "windows_credential_manager";
+export type RuntimePlatform = "macos" | "windows" | "other";
 
 export interface PopupKeyboardEntry {
   revision: number;
@@ -373,7 +375,14 @@ export interface AcceptanceExportReceipt {
   valid: boolean;
 }
 
-let browserSettings: AppSettings = DEFAULT_SETTINGS;
+const browserRuntimePlatform: RuntimePlatform =
+  new URLSearchParams(window.location.search).get("platform") === "windows"
+    ? "windows"
+    : "macos";
+let browserSettings: AppSettings = {
+  ...DEFAULT_SETTINGS,
+  enableAutomaticSelection: browserRuntimePlatform !== "windows"
+};
 let browserHasApiKey = false;
 let browserPopupState: PopupState = getInitialBrowserPopupState();
 const browserPopupListeners = new Set<(state: PopupState) => void>();
@@ -894,23 +903,60 @@ function browserAcceptanceArmKey(scenario: AcceptanceScenario, ordinal: number):
 }
 
 function getBrowserSettingsPayload(): SettingsPayload {
+  const runtimePlatform = browserRuntimePlatform;
   const payload: SettingsPayload = {
     settings: browserSettings,
     hasApiKey: browserHasApiKey,
     apiKeyStatus: browserHasApiKey ? "configured" : "missing",
-    apiKeyStorage: "system_keychain",
+    apiKeyStorage:
+      runtimePlatform === "windows" ? "windows_credential_manager" : "system_keychain",
+    runtimePlatform,
     doubleCopyStatus: {
       available: true,
       running: true,
-      message: "Cmd+C+C 监听已启用。"
+      message:
+        runtimePlatform === "windows"
+          ? "Ctrl+C+C 双复制取词已就绪；只确认用户主动执行的复制。"
+          : "Cmd+C+C 监听已启用。",
+      code: runtimePlatform === "windows" ? "windows_double_copy_ready" : "ready"
     },
     selectionStatus: {
       available: true,
       running: true,
-      message: "鼠标选区监听、AX selectedText 通知与直接读取均已启用。",
-      code: "selection_sources_ready"
+      message:
+        runtimePlatform === "windows"
+          ? browserSettings.enableAutomaticSelection
+            ? "Windows 鼠标划词与快捷键取词已就绪；快捷键为 Ctrl+Alt+T。"
+            : "Windows 快捷键取词已就绪：选中文字后按 Ctrl+Alt+T。"
+          : "鼠标选区监听、AX selectedText 通知与直接读取均已启用。",
+      code:
+        runtimePlatform === "windows"
+          ? browserSettings.enableAutomaticSelection
+            ? "windows_auto_selection_ready"
+            : "windows_uia_shortcut_ready"
+          : "selection_sources_ready"
     },
-    capabilitySnapshot: {
+    capabilitySnapshot: runtimePlatform === "windows" ? {
+      accessibility: {
+        grant: "granted",
+        health: "ready",
+        statusCode: "windows_uia_no_consent_required"
+      },
+      listenEvent: {
+        grant: "granted",
+        health: "ready",
+        statusCode: "windows_raw_input_no_consent_required"
+      },
+      mouseTap: browserSettings.enableAutomaticSelection
+        ? { health: "ready", statusCode: "windows_raw_mouse_ready" }
+        : { health: "disabled", statusCode: "windows_auto_selection_disabled_by_setting" },
+      keyTap: { health: "ready", statusCode: "windows_raw_input_ready" },
+      axSelectedTextObserver: browserSettings.enableAutomaticSelection
+        ? { health: "ready", statusCode: "windows_uia_observer_ready" }
+        : { health: "disabled", statusCode: "windows_auto_selection_disabled_by_setting" },
+      directSelectionRead: { health: "unknown", statusCode: "windows_uia_not_probed" },
+      clipboardDoubleCopyFallback: { health: "ready", statusCode: "windows_double_copy_ready" }
+    } : {
       accessibility: {
         grant: "granted",
         health: "ready",
@@ -927,7 +973,7 @@ function getBrowserSettingsPayload(): SettingsPayload {
       directSelectionRead: { health: "ready", statusCode: "selection_read_found" },
       clipboardDoubleCopyFallback: { health: "disabled", statusCode: "inactive_key_tap_ready" }
     },
-    permissionDiagnostics: {
+    permissionDiagnostics: runtimePlatform === "windows" ? undefined : {
       bundleIdentifier: "com.paperfloat.translator",
       appVersion: "0.1.0-test",
       bundlePath: "/Applications/Paper Float Translator.app",
@@ -965,6 +1011,22 @@ function getBrowserSettingsPayload(): SettingsPayload {
       health: "disabled",
       statusCode: "selection_disabled_by_setting"
     };
+    if (runtimePlatform === "windows") {
+      payload.doubleCopyStatus = {
+        available: true,
+        running: false,
+        code: "selection_disabled",
+        message: "Ctrl+C+C 双复制取词已在设置中关闭。"
+      };
+      payload.capabilitySnapshot.keyTap = {
+        health: "disabled",
+        statusCode: "selection_disabled"
+      };
+      payload.capabilitySnapshot.clipboardDoubleCopyFallback = {
+        health: "disabled",
+        statusCode: "selection_disabled"
+      };
+    }
     payload.permissionDiagnostics = payload.permissionDiagnostics
       ? { ...payload.permissionDiagnostics, selectionRead: undefined }
       : undefined;

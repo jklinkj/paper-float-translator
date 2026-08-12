@@ -33,6 +33,7 @@ export interface AppSettings {
   cleanPdfText: boolean;
   enableCache: boolean;
   enableSelectionPopup: boolean;
+  enableAutomaticSelection: boolean;
   targetLanguage: string;
   popupWidth: number;
 }
@@ -43,6 +44,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   cleanPdfText: true,
   enableCache: true,
   enableSelectionPopup: true,
+  enableAutomaticSelection: true,
   targetLanguage: DEFAULT_TARGET_LANGUAGE,
   popupWidth: 420
 };
@@ -248,6 +250,79 @@ export function getSelectionCapabilityPresentation(snapshot: CapabilitySnapshot)
   const mouseReady = snapshot.mouseTap.health === "ready";
   const observerReady = snapshot.axSelectedTextObserver.health === "ready";
 
+  if (isWindowsCapabilitySnapshot(snapshot)) {
+    if (snapshot.directSelectionRead.statusCode === "windows_shortcut_registration_failed") {
+      return {
+        value: "快捷键冲突",
+        tone: "warning",
+        detail: "Ctrl+Alt+T 无法注册，可能已被其他应用占用。"
+      };
+    }
+
+    if (
+      snapshot.directSelectionRead.health === "disabled" &&
+      snapshot.directSelectionRead.statusCode === "selection_disabled"
+    ) {
+      return {
+        value: "已关闭",
+        tone: "neutral",
+        detail: "Windows 选区取词已在设置中关闭。"
+      };
+    }
+
+    const shortcutAvailable =
+      directReadReady ||
+      (snapshot.directSelectionRead.health === "unknown" &&
+        snapshot.directSelectionRead.statusCode === "windows_uia_not_probed");
+    const automaticDisabledBySetting =
+      snapshot.mouseTap.statusCode === "windows_auto_selection_disabled_by_setting" &&
+      snapshot.axSelectedTextObserver.statusCode === "windows_auto_selection_disabled_by_setting";
+
+    if (shortcutAvailable && mouseReady && observerReady) {
+      return {
+        value: "鼠标划词 + Ctrl+Alt+T 可用",
+        tone: "ok",
+        detail: "仅由完整鼠标选择手势触发，UI Automation 只负责读取；复制粘贴与键盘选择不会自动弹出，也不会改写剪贴板。"
+      };
+    }
+
+    if (shortcutAvailable && (mouseReady || observerReady)) {
+      return {
+        value: "自动划词降级可用",
+        tone: "warning",
+        detail: mouseReady
+          ? "鼠标手势门控可用，UI Automation 选区读取辅助当前受限；Ctrl+Alt+T 仍可使用。"
+          : "UI Automation 读取可用，鼠标手势门控当前受限；Ctrl+Alt+T 仍可使用。"
+      };
+    }
+
+    if (shortcutAvailable) {
+      const automaticUnavailable =
+        !automaticDisabledBySetting &&
+        [snapshot.mouseTap.health, snapshot.axSelectedTextObserver.health].some(
+          (health) => health === "degraded" || health === "unavailable"
+        );
+      return {
+        value: directReadReady ? "Ctrl+Alt+T 已验证" : "Ctrl+Alt+T 可用",
+        tone: automaticUnavailable ? "warning" : "ok",
+        detail: automaticUnavailable
+          ? "自动划词监听当前受限；Ctrl+Alt+T 与 Ctrl+C+C 仍可使用。"
+          : directReadReady
+            ? "已通过 Windows UI Automation 读取选区，不会改写剪贴板。"
+            : "全局快捷键已注册；选中文本后按 Ctrl+Alt+T 即可读取。"
+      };
+    }
+
+    return {
+      value: snapshot.directSelectionRead.health === "unavailable" ? "取词不可用" : "取词需重试",
+      tone: "warning",
+      detail:
+        snapshot.directSelectionRead.health === "unavailable"
+          ? "Windows UI Automation 取词当前不可用；Ctrl+C+C 仍可作为兜底。"
+          : "最近一次 Windows 选区读取没有成功；请重新选择文本后再按 Ctrl+Alt+T。"
+    };
+  }
+
   if (directReadReady && mouseReady && observerReady) {
     return {
       value: "完整可用",
@@ -310,6 +385,36 @@ export function getSelectionCapabilityPresentation(snapshot: CapabilitySnapshot)
 }
 
 export function getDoubleCopyCapabilityPresentation(snapshot: CapabilitySnapshot): CapabilityPresentation {
+  if (isWindowsCapabilitySnapshot(snapshot)) {
+    if (
+      snapshot.keyTap.health === "disabled" &&
+      snapshot.clipboardDoubleCopyFallback.health === "disabled"
+    ) {
+      return {
+        value: "已关闭",
+        tone: "neutral",
+        detail: "Ctrl+C+C 双复制取词已在设置中关闭。"
+      };
+    }
+
+    if (
+      snapshot.keyTap.health === "ready" &&
+      snapshot.clipboardDoubleCopyFallback.health === "ready"
+    ) {
+      return {
+        value: "Ctrl+C+C 可用",
+        tone: "ok",
+        detail: "只观察用户主动执行的复制，不会模拟按键或轮询剪贴板。"
+      };
+    }
+
+    return {
+      value: "Ctrl+C+C 不可用",
+      tone: "warning",
+      detail: "Windows 后台复制监听未能启动；仍可使用 Ctrl+Alt+T 取词。"
+    };
+  }
+
   if (snapshot.keyTap.health === "ready") {
     return {
       value: "按键监听可用",
@@ -344,6 +449,18 @@ export function getDoubleCopyCapabilityPresentation(snapshot: CapabilitySnapshot
         detail: "剪贴板双复制回退当前不可用。"
       };
   }
+}
+
+function isWindowsCapabilitySnapshot(snapshot: CapabilitySnapshot): boolean {
+  return [
+    snapshot.accessibility.statusCode,
+    snapshot.listenEvent.statusCode,
+    snapshot.mouseTap.statusCode,
+    snapshot.keyTap.statusCode,
+    snapshot.axSelectedTextObserver.statusCode,
+    snapshot.directSelectionRead.statusCode,
+    snapshot.clipboardDoubleCopyFallback.statusCode
+  ].some((statusCode) => statusCode?.startsWith("windows_") === true);
 }
 
 export interface CacheEntry {

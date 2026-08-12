@@ -2,18 +2,23 @@ import { type ReactNode, useEffect, useRef, useState } from "react";
 import {
   AlertCircle,
   Check,
+  ChevronDown,
   Copy,
   Database,
   Eraser,
   ExternalLink,
+  HardDrive,
   KeyRound,
+  Keyboard,
   Languages,
   Loader2,
   MousePointer2,
   RefreshCcw,
   RotateCcw,
   Save,
-  Settings
+  Settings,
+  ShieldCheck,
+  SlidersHorizontal
 } from "lucide-react";
 import {
   DEFAULT_SETTINGS,
@@ -32,11 +37,13 @@ import {
   type ApiKeyStatus,
   type ApiKeyStorage,
   type PermissionDiagnostics,
+  type RuntimePlatform,
   type SettingsPayload
 } from "./desktopApi";
 import { AcceptancePanel } from "./AcceptancePanel";
 import { hasUnsavedSettingsChanges } from "./settingsDraft";
 import { getSettingsRuntimeWarning } from "./settingsRuntimeWarning";
+import { loadSettingsAfterStartup } from "./settingsStartup";
 
 const MODEL_OPTIONS: Array<{ value: DeepSeekModel; label: string }> = [
   { value: "deepseek-v4-flash", label: "DeepSeek V4 Flash" },
@@ -59,6 +66,7 @@ export function SettingsView(): JSX.Element {
   const [apiKey, setApiKey] = useState("");
   const [apiKeyStatus, setApiKeyStatus] = useState<ApiKeyStatus>("missing");
   const [apiKeyStorage, setApiKeyStorage] = useState<ApiKeyStorage>("system_keychain");
+  const [runtimePlatform, setRuntimePlatform] = useState<RuntimePlatform>("macos");
   const hasApiKey = apiKeyStatus === "configured";
   const [doubleCopyStatus, setDoubleCopyStatus] = useState<WatcherStatus>({
     available: true,
@@ -86,6 +94,7 @@ export function SettingsView(): JSX.Element {
   function applyRuntimeStatus(payload: SettingsPayload): void {
     setApiKeyStatus(payload.apiKeyStatus);
     setApiKeyStorage(payload.apiKeyStorage);
+    setRuntimePlatform(payload.runtimePlatform);
     setDoubleCopyStatus(payload.doubleCopyStatus);
     setSelectionStatus(payload.selectionStatus);
     setCapabilitySnapshot(payload.capabilitySnapshot);
@@ -160,8 +169,7 @@ export function SettingsView(): JSX.Element {
     setLoading(true);
     setInitialLoadError(null);
 
-    desktopApi
-      .getSettings()
+    loadSettingsAfterStartup(() => desktopApi.getSettings())
       .then((payload) => {
         if (!alive) {
           return;
@@ -173,7 +181,7 @@ export function SettingsView(): JSX.Element {
       })
       .catch((loadError: unknown) => {
         if (alive) {
-          setInitialLoadError(loadError instanceof Error ? loadError.message : "读取设置失败。");
+          setInitialLoadError(formatErrorMessage(loadError, "读取设置失败。"));
         }
       })
       .finally(() => {
@@ -390,9 +398,7 @@ export function SettingsView(): JSX.Element {
         setNotice("已从磁盘安全应用设置并刷新监听器。 ");
       }
     } catch (refreshError) {
-      setInitialLoadError(
-        refreshError instanceof Error ? refreshError.message : "无法从磁盘安全应用设置。"
-      );
+      setInitialLoadError(formatErrorMessage(refreshError, "无法从磁盘安全应用设置。"));
     } finally {
       setLoading(false);
     }
@@ -444,13 +450,19 @@ export function SettingsView(): JSX.Element {
     }
   }
 
+  const isWindows = runtimePlatform === "windows";
+  const copyShortcut = isWindows ? "Ctrl+C+C" : "Cmd+C+C";
   const selectionDisabledConfirmed =
     !savedSettings.enableSelectionPopup && selectionStatus.code === "selection_disabled_by_setting";
-  const selectionDisabledHealthy = selectionDisabledConfirmed && doubleCopyStatus.running;
+  const selectionDisabledHealthy =
+    selectionDisabledConfirmed &&
+    (isWindows ? doubleCopyStatus.code === "selection_disabled" : doubleCopyStatus.running);
   const selectionStatusMessage = savedSettings.enableSelectionPopup
     ? selectionStatus.message || "自动选区监听状态未知。"
     : selectionDisabledHealthy
-      ? "拖选浮窗已确认关闭，仍可使用 Cmd+C+C。"
+      ? isWindows
+        ? "Windows 选区取词已确认关闭；Ctrl+Alt+T 与 Ctrl+C+C 均不会触发。"
+        : `拖选浮窗已确认关闭，仍可使用 ${copyShortcut}。`
       : selectionDisabledConfirmed
         ? [selectionStatus.message, doubleCopyStatus.message].filter(Boolean).join(" ")
         : selectionStatus.message || "自动划词设置已关闭，但原生资源释放状态尚未确认。";
@@ -458,26 +470,39 @@ export function SettingsView(): JSX.Element {
     ? draftSettings.targetLanguage
     : CUSTOM_LANGUAGE_VALUE;
   const capabilityPresentation = getSelectionCapabilityPresentation(capabilitySnapshot);
+  const effectiveSelectionPresentation =
+    savedSettings.enableSelectionPopup && !selectionStatus.running && selectionStatus.message
+      ? {
+          value:
+            selectionStatus.code === "selection_runtime_degraded"
+              ? "正在恢复"
+              : selectionStatus.available
+                ? "运行受限"
+                : "不可用",
+          tone: "warning" as const,
+          detail: selectionStatus.message
+        }
+      : capabilityPresentation;
   const selectionDisplayDetail = savedSettings.enableSelectionPopup
-    ? capabilityPresentation.detail
+    ? effectiveSelectionPresentation.detail
     : selectionStatusMessage;
   const doubleCopyPresentation = getDoubleCopyCapabilityPresentation(capabilitySnapshot);
   const permissionActions = getCapabilityPermissionActions(capabilitySnapshot);
   const selectionTone: StatusTone = savedSettings.enableSelectionPopup
-    ? capabilityPresentation.tone
+    ? effectiveSelectionPresentation.tone
     : selectionDisabledHealthy
       ? "neutral"
       : "warning";
   const selectionStatusValue = savedSettings.enableSelectionPopup
-    ? capabilityPresentation.value
+    ? effectiveSelectionPresentation.value
     : selectionDisabledConfirmed
       ? selectionDisabledHealthy
         ? "已关闭"
         : "已关闭 / 兜底停用"
       : "停用待确认";
   const selectionDiagnostic =
-    savedSettings.enableSelectionPopup && capabilityPresentation.tone === "warning"
-      ? { detail: capabilityPresentation.detail }
+    savedSettings.enableSelectionPopup && effectiveSelectionPresentation.tone === "warning"
+      ? { detail: effectiveSelectionPresentation.detail }
       : !savedSettings.enableSelectionPopup && !selectionDisabledHealthy
         ? { detail: selectionStatusMessage }
         : null;
@@ -500,13 +525,21 @@ export function SettingsView(): JSX.Element {
   const shouldShowPermissionActions =
     selectionDiagnostic !== null ||
     (savedSettings.enableSelectionPopup && shouldShowPermissionDiagnostics);
-  const lifecycleMessage = savedSettings.enableSelectionPopup
-    ? "关闭设置窗口只会隐藏界面，拖选与 Cmd+C+C 监听会继续在后台运行；点击 Dock 图标可重新打开，按 Cmd+Q 才会完全退出。"
-    : selectionDisabledHealthy
-      ? "关闭设置窗口只会隐藏界面；拖选监听已确认关闭，Cmd+C+C 仍会在后台运行。点击 Dock 图标可重新打开，按 Cmd+Q 才会完全退出。"
-      : selectionDisabledConfirmed
-        ? "拖选监听已关闭，但 Cmd+C+C 当前也未运行；请刷新诊断以恢复，按 Cmd+Q 可完全退出。"
-        : "自动划词停用尚未得到原生资源释放确认；请刷新诊断，若仍未确认请按 Cmd+Q 退出后重新打开。";
+  const lifecycleMessage = isWindows
+    ? savedSettings.enableSelectionPopup
+      ? savedSettings.enableAutomaticSelection
+        ? "关闭设置窗口只会隐藏界面；鼠标划词、Ctrl+Alt+T 与 Ctrl+C+C 会继续在后台运行。可从系统托盘重新打开，在托盘菜单选择“退出”才会完全退出。"
+        : "关闭设置窗口只会隐藏界面；Ctrl+Alt+T 与 Ctrl+C+C 会继续在后台运行。可从系统托盘重新打开，在托盘菜单选择“退出”才会完全退出。"
+      : selectionDisabledHealthy
+        ? "关闭设置窗口只会隐藏界面；Windows 选区取词已确认关闭。可从系统托盘重新打开或完全退出。"
+        : "Windows 选区取词停用状态尚未确认；请刷新诊断，若仍未确认请从系统托盘退出后重新打开。"
+    : savedSettings.enableSelectionPopup
+      ? "关闭设置窗口只会隐藏界面，拖选与 Cmd+C+C 监听会继续在后台运行；点击 Dock 图标可重新打开，按 Cmd+Q 才会完全退出。"
+      : selectionDisabledHealthy
+        ? "关闭设置窗口只会隐藏界面；拖选监听已确认关闭，Cmd+C+C 仍会在后台运行。点击 Dock 图标可重新打开，按 Cmd+Q 才会完全退出。"
+        : selectionDisabledConfirmed
+          ? "拖选监听已关闭，但 Cmd+C+C 当前也未运行；请刷新诊断以恢复，按 Cmd+Q 可完全退出。"
+          : "自动划词停用尚未得到原生资源释放确认；请刷新诊断，若仍未确认请按 Cmd+Q 退出后重新打开。";
   const hasUnsavedChanges = hasUnsavedSettingsChanges(
     savedSettings,
     draftSettings,
@@ -554,11 +587,15 @@ export function SettingsView(): JSX.Element {
           <div>
             <p className="eyebrow">Paper Float Translator</p>
             <h1>AI 翻译助手</h1>
-            <p>为论文阅读保留一个低打扰的翻译浮窗，拖选或 Cmd+C+C 即可触发。</p>
+            <p className="brand-description">
+              {isWindows
+                ? "为论文阅读提供安静、可控的桌面翻译。你的关闭操作永远优先。"
+                : "为论文阅读保留一个低打扰的翻译浮窗，拖选或 Cmd+C+C 即可触发。"}
+            </p>
           </div>
         </div>
         <div className="header-actions">
-          <span className="platform-pill">macOS · Tauri</span>
+          <span className="platform-pill">{isWindows ? "Windows · Tauri" : "macOS · Tauri"}</span>
           <button
             className="icon-link"
             type="button"
@@ -580,20 +617,26 @@ export function SettingsView(): JSX.Element {
             apiKeyStatus === "configured"
               ? apiKeyStorage === "local_file"
                 ? "本地构建：Key 仅保存在当前用户可读文件，不访问系统钥匙串"
-                : "Key 已保存在系统钥匙串"
+                : apiKeyStorage === "windows_credential_manager"
+                  ? "Key 已保存在当前用户的 Windows 凭据管理器"
+                  : "Key 已保存在系统钥匙串"
               : apiKeyStatus === "unavailable"
                 ? apiKeyStorage === "local_file"
                   ? "本地 Key 文件暂不可读；请在下方重新保存"
-                  : "后台不会弹出密码框；请在下方重新保存 API Key"
+                  : apiKeyStorage === "windows_credential_manager"
+                    ? "Windows 凭据管理器暂不可读；请在下方重新保存 API Key"
+                    : "后台不会弹出密码框；请在下方重新保存 API Key"
                 : apiKeyStorage === "local_file"
                   ? "本地构建不读取钥匙串；请重新保存一次 API Key"
-                  : "旧签名钥匙串条目已停用；请重新保存一次 API Key"
+                  : apiKeyStorage === "windows_credential_manager"
+                    ? "尚未在 Windows 凭据管理器中保存 API Key"
+                    : "旧签名钥匙串条目已停用；请重新保存一次 API Key"
           }
           tone={apiKeyStatus === "configured" ? "ok" : "warning"}
         />
         <StatusItem
           icon={<MousePointer2 size={19} />}
-          label="选区监听"
+          label={isWindows ? "Windows 取词" : "选区监听"}
           value={selectionStatusValue}
           detail={selectionDisplayDetail}
           tone={selectionTone}
@@ -602,13 +645,13 @@ export function SettingsView(): JSX.Element {
           icon={<Database size={19} />}
           label="本地缓存"
           value={savedSettings.enableCache ? "已启用" : "已关闭"}
-          detail={savedSettings.enableCache ? "相同文本会优先复用结果" : "每次翻译都会重新请求"}
+          detail={savedSettings.enableCache ? "最多 500 条，7 天后自动清理" : "每次翻译都会重新请求"}
           tone={savedSettings.enableCache ? "ok" : "neutral"}
         />
       </section>
 
       <div className="settings-edit-state" data-dirty={hasUnsavedChanges}>
-        <span>上方显示当前已生效状态；下方表单是设置草稿。</span>
+        <span>状态卡显示当前生效设置；下面的修改保存后应用。</span>
         <strong>{hasUnsavedChanges ? "草稿尚未保存" : "草稿与当前生效设置一致"}</strong>
       </div>
 
@@ -620,7 +663,7 @@ export function SettingsView(): JSX.Element {
             </div>
             <div>
               <h2>翻译服务</h2>
-              <p>DeepSeek 连接与默认翻译参数。</p>
+              <p>连接模型，并设定每次翻译的默认结果。</p>
             </div>
           </div>
 
@@ -634,10 +677,14 @@ export function SettingsView(): JSX.Element {
                 hasApiKey
                   ? apiKeyStorage === "local_file"
                     ? "已保存在当前用户私有文件，留空则不修改"
-                    : "已保存在新钥匙串条目，留空则不修改"
+                    : apiKeyStorage === "windows_credential_manager"
+                      ? "已保存在 Windows 凭据管理器，留空则不修改"
+                      : "已保存在新钥匙串条目，留空则不修改"
                   : apiKeyStorage === "local_file"
                     ? "重新输入 DeepSeek API Key（本地构建不读取钥匙串）"
-                    : "重新输入 DeepSeek API Key（不会读取旧条目）"
+                    : apiKeyStorage === "windows_credential_manager"
+                      ? "输入 DeepSeek API Key（将保存到 Windows 凭据管理器）"
+                      : "重新输入 DeepSeek API Key（不会读取旧条目）"
               }
               onChange={(event) => setApiKey(event.target.value)}
             />
@@ -707,7 +754,11 @@ export function SettingsView(): JSX.Element {
                 }
               />
             ) : null}
-            <small>拖选翻译和 Cmd+C+C 会直接使用这个语言。</small>
+            <small>
+              {isWindows
+                ? "Ctrl+Alt+T 与 Ctrl+C+C 取词会直接使用这个语言。"
+                : "拖选翻译和 Cmd+C+C 会直接使用这个语言。"}
+            </small>
           </label>
         </div>
 
@@ -717,14 +768,25 @@ export function SettingsView(): JSX.Element {
               <Settings size={18} />
             </div>
             <div>
-              <h2>桌面行为</h2>
-              <p>控制触发方式、浮窗尺寸和本地处理。</p>
+              <h2>取词与浮窗</h2>
+              <p>决定何时出现、怎样关闭，以及如何再次唤起。</p>
             </div>
           </div>
 
           <p className="lifecycle-note">
             {lifecycleMessage}
           </p>
+
+          <div className="interaction-rule" role="note" aria-label="浮窗关闭规则">
+            <ShieldCheck size={18} aria-hidden="true" />
+            <div>
+              <strong>关闭优先</strong>
+              <p>
+                关闭、按 Esc、点到浮窗外或复制原文后，同一选区保持静默；取消选区或选择不同文字后自动恢复。
+                {isWindows ? " Ctrl+Alt+T 与 Ctrl+C+C 可随时主动重新唤起。" : ` ${copyShortcut} 可随时主动重新唤起。`}
+              </p>
+            </div>
+          </div>
 
           <label className="switch-row">
             <input
@@ -737,10 +799,33 @@ export function SettingsView(): JSX.Element {
             />
             <span className="switch-track" aria-hidden="true" />
             <span className="switch-copy">
-              <strong>拖选后显示操作浮窗</strong>
+              <strong>{isWindows ? "启用 Windows 选区取词" : "拖选后显示操作浮窗"}</strong>
               <small>{selectionDisplayDetail}</small>
             </span>
           </label>
+
+          {isWindows ? (
+            <label className="switch-row">
+              <input
+                type="checkbox"
+                checked={draftSettings.enableAutomaticSelection}
+                disabled={saving || !draftSettings.enableSelectionPopup}
+                onChange={(event) =>
+                  setDraftSettings({
+                    ...draftSettings,
+                    enableAutomaticSelection: event.target.checked
+                  })
+                }
+              />
+              <span className="switch-track" aria-hidden="true" />
+              <span className="switch-copy">
+                <strong>鼠标主动划词后显示</strong>
+                <small>
+                  仅在其他应用中完成一次鼠标选择手势后显示；复制粘贴、键盘选择和程序改动选区都不会自动弹出。关闭浮窗会静默当前选区，不会模拟按键或改写剪贴板。成功读取的文字会按当前设置发送给模型提供方。
+                </small>
+              </span>
+            </label>
+          ) : null}
 
           {shouldShowPermissionActions ? (
             <div className="permission-actions" role="group" aria-label="选区监听权限操作">
@@ -777,106 +862,129 @@ export function SettingsView(): JSX.Element {
               </button>
               {selectionDiagnostic ? <small>{selectionDiagnostic.detail}</small> : null}
               {permissionDiagnostics ? (
-                <div className="permission-diagnostics">
-                  <div>
-                    <span>辅助功能授权</span>
-                    <strong>{formatPermissionGrant(capabilitySnapshot.accessibility.grant)}</strong>
+                <details className="diagnostics-expander">
+                  <summary>
+                    <span>查看运行诊断</span>
+                    <ChevronDown size={16} aria-hidden="true" />
+                  </summary>
+                  <div className="permission-diagnostics">
+                    <div>
+                      <span>辅助功能授权</span>
+                      <strong>{formatPermissionGrant(capabilitySnapshot.accessibility.grant)}</strong>
+                    </div>
+                    <div>
+                      <span>Listen Event 授权</span>
+                      <strong>{formatPermissionGrant(capabilitySnapshot.listenEvent.grant)}</strong>
+                    </div>
+                    <div>
+                      <span>鼠标 tap</span>
+                      <strong>{formatCapabilityHealth(capabilitySnapshot.mouseTap.health)}</strong>
+                    </div>
+                    <div>
+                      <span>键盘 tap</span>
+                      <strong>{formatCapabilityHealth(capabilitySnapshot.keyTap.health)}</strong>
+                    </div>
+                    <div>
+                      <span>AX selectedText</span>
+                      <strong>{formatCapabilityHealth(capabilitySnapshot.axSelectedTextObserver.health)}</strong>
+                    </div>
+                    <div>
+                      <span>直接读取选区</span>
+                      <strong>{formatCapabilityHealth(capabilitySnapshot.directSelectionRead.health)}</strong>
+                    </div>
+                    <div>
+                      <span>剪贴板双复制回退</span>
+                      <strong>{formatCapabilityHealth(capabilitySnapshot.clipboardDoubleCopyFallback.health)}</strong>
+                    </div>
+                    <div>
+                      <span>签名</span>
+                      <strong>{formatSignatureKind(permissionDiagnostics.signatureKind)}</strong>
+                    </div>
+                    <div>
+                      <span>应用版本</span>
+                      <strong>{permissionDiagnostics.appVersion}</strong>
+                    </div>
+                    <div>
+                      <span>Team ID</span>
+                      <code>{permissionDiagnostics.teamIdentifier || "not set"}</code>
+                    </div>
+                    <div>
+                      <span>CDHash</span>
+                      <code>{permissionDiagnostics.cdHash || "unknown"}</code>
+                    </div>
+                    <div className="wide">
+                      <span>运行路径</span>
+                      <code>{permissionDiagnostics.bundlePath}</code>
+                    </div>
+                    {permissionDiagnostics.selectionRead ? (
+                      <>
+                        <div>
+                          <span>最近读取</span>
+                          <strong>{formatSelectionReadStatus(permissionDiagnostics.selectionRead.status)}</strong>
+                        </div>
+                        <div>
+                          <span>触发来源</span>
+                          <code>{permissionDiagnostics.selectionRead.reason}</code>
+                        </div>
+                        <div>
+                          <span>来源 bundle ID</span>
+                          <code>{permissionDiagnostics.selectionRead.sourceBundleId}</code>
+                        </div>
+                        <div>
+                          <span>读取耗时</span>
+                          <strong>{permissionDiagnostics.selectionRead.durationMs.toFixed(1)} ms</strong>
+                        </div>
+                        <div>
+                          <span>候选元素</span>
+                          <strong>{permissionDiagnostics.selectionRead.candidateCount}</strong>
+                        </div>
+                        <div>
+                          <span>AX 错误</span>
+                          <code>{permissionDiagnostics.selectionRead.axError}</code>
+                        </div>
+                      </>
+                    ) : null}
+                    {permissionDiagnostics.signatureKind !== "developer_id" ? (
+                      <p>
+                        当前签名不是 Developer ID Application，不能作为最终发布与 TCC 持久性验收包。
+                        ad-hoc 覆盖安装后 macOS 还可能显示旧授权，但这不代表当前构建已获信任。
+                      </p>
+                    ) : null}
+                    <button type="button" className="inline-action" onClick={handleCopyPermissionDiagnostics}>
+                      <Copy size={14} />
+                      复制诊断信息
+                    </button>
                   </div>
-                  <div>
-                    <span>Listen Event 授权</span>
-                    <strong>{formatPermissionGrant(capabilitySnapshot.listenEvent.grant)}</strong>
-                  </div>
-                  <div>
-                    <span>鼠标 tap</span>
-                    <strong>{formatCapabilityHealth(capabilitySnapshot.mouseTap.health)}</strong>
-                  </div>
-                  <div>
-                    <span>键盘 tap</span>
-                    <strong>{formatCapabilityHealth(capabilitySnapshot.keyTap.health)}</strong>
-                  </div>
-                  <div>
-                    <span>AX selectedText</span>
-                    <strong>{formatCapabilityHealth(capabilitySnapshot.axSelectedTextObserver.health)}</strong>
-                  </div>
-                  <div>
-                    <span>直接读取选区</span>
-                    <strong>{formatCapabilityHealth(capabilitySnapshot.directSelectionRead.health)}</strong>
-                  </div>
-                  <div>
-                    <span>剪贴板双复制回退</span>
-                    <strong>{formatCapabilityHealth(capabilitySnapshot.clipboardDoubleCopyFallback.health)}</strong>
-                  </div>
-                  <div>
-                    <span>签名</span>
-                    <strong>{formatSignatureKind(permissionDiagnostics.signatureKind)}</strong>
-                  </div>
-                  <div>
-                    <span>应用版本</span>
-                    <strong>{permissionDiagnostics.appVersion}</strong>
-                  </div>
-                  <div>
-                    <span>Team ID</span>
-                    <code>{permissionDiagnostics.teamIdentifier || "not set"}</code>
-                  </div>
-                  <div>
-                    <span>CDHash</span>
-                    <code>{permissionDiagnostics.cdHash || "unknown"}</code>
-                  </div>
-                  <div className="wide">
-                    <span>运行路径</span>
-                    <code>{permissionDiagnostics.bundlePath}</code>
-                  </div>
-                  {permissionDiagnostics.selectionRead ? (
-                    <>
-                      <div>
-                        <span>最近读取</span>
-                        <strong>{formatSelectionReadStatus(permissionDiagnostics.selectionRead.status)}</strong>
-                      </div>
-                      <div>
-                        <span>触发来源</span>
-                        <code>{permissionDiagnostics.selectionRead.reason}</code>
-                      </div>
-                      <div>
-                        <span>来源 bundle ID</span>
-                        <code>{permissionDiagnostics.selectionRead.sourceBundleId}</code>
-                      </div>
-                      <div>
-                        <span>读取耗时</span>
-                        <strong>{permissionDiagnostics.selectionRead.durationMs.toFixed(1)} ms</strong>
-                      </div>
-                      <div>
-                        <span>候选元素</span>
-                        <strong>{permissionDiagnostics.selectionRead.candidateCount}</strong>
-                      </div>
-                      <div>
-                        <span>AX 错误</span>
-                        <code>{permissionDiagnostics.selectionRead.axError}</code>
-                      </div>
-                    </>
-                  ) : null}
-                  {permissionDiagnostics.signatureKind !== "developer_id" ? (
-                    <p>
-                      当前签名不是 Developer ID Application，不能作为最终发布与 TCC 持久性验收包。
-                      ad-hoc 覆盖安装后 macOS 还可能显示旧授权，但这不代表当前构建已获信任。
-                    </p>
-                  ) : null}
-                  <button type="button" className="inline-action" onClick={handleCopyPermissionDiagnostics}>
-                    <Copy size={14} />
-                    复制诊断信息
-                  </button>
-                </div>
+                </details>
               ) : null}
             </div>
           ) : null}
 
-          <label className="field">
-            <span>兜底触发</span>
-            <input value="快速按两次 Cmd+C" readOnly />
-            <small>{doubleCopyStatus.message || "双复制监听状态未知。"}</small>
-            {doubleCopyPresentation.tone === "warning" ? <small>{doubleCopyPresentation.detail}</small> : null}
-          </label>
+          <div className="trigger-list" aria-label="主动触发方式">
+            {isWindows ? (
+              <div className="trigger-row">
+                <Keyboard size={17} aria-hidden="true" />
+                <span>
+                  <strong>快捷键取词</strong>
+                  <small>明确请求翻译，也可覆盖当前静默选区。</small>
+                </span>
+                <kbd>Ctrl + Alt + T</kbd>
+              </div>
+            ) : null}
+            <div className="trigger-row">
+              <Copy size={17} aria-hidden="true" />
+              <span>
+                <strong>双复制兜底</strong>
+                <small>{doubleCopyStatus.message || "双复制监听状态未知。"}</small>
+              </span>
+              <kbd>{isWindows ? "Ctrl + C + C" : "Cmd + C + C"}</kbd>
+            </div>
+            {doubleCopyPresentation.tone === "warning" ? (
+              <p className="trigger-warning">{doubleCopyPresentation.detail}</p>
+            ) : null}
+          </div>
 
-          <label className="field">
+          <label className="field compact-field popup-width-field">
             <span>浮窗宽度</span>
             <input
               type="number"
@@ -887,9 +995,23 @@ export function SettingsView(): JSX.Element {
               disabled={saving}
               onChange={(event) => setPopupWidthInput(event.target.value)}
             />
-            <small>范围 320-640，保存时生效。</small>
+            <small>320–640 像素，保存时生效。</small>
           </label>
+        </div>
+      </section>
 
+      <details className="panel advanced-panel">
+        <summary>
+          <span className="section-icon" aria-hidden="true">
+            <SlidersHorizontal size={18} />
+          </span>
+          <span>
+            <strong>本地处理与数据</strong>
+            <small>PDF 清洗、缓存、凭据清理与卸载说明</small>
+          </span>
+          <ChevronDown className="advanced-chevron" size={18} aria-hidden="true" />
+        </summary>
+        <div className="advanced-content">
           <label className="switch-row">
             <input
               type="checkbox"
@@ -918,11 +1040,31 @@ export function SettingsView(): JSX.Element {
             <span className="switch-track" aria-hidden="true" />
             <span className="switch-copy">
               <strong>启用本地翻译缓存</strong>
-              <small>相同参数的文本会优先使用本地结果。</small>
+              <small>缓存包含原文与译文，最多 500 条并在 7 天后自动清理。</small>
             </span>
           </label>
+
+          <div className="data-actions" role="group" aria-label="本地数据操作">
+            <button type="button" className="secondary" onClick={handleClearCache} disabled={saving}>
+              <Eraser size={16} />
+              清空缓存
+            </button>
+            <button
+              type="button"
+              className="secondary"
+              onClick={handleClearApiKey}
+              disabled={saving || apiKeyStatus === "missing"}
+            >
+              <KeyRound size={16} />
+              清除 Key
+            </button>
+          </div>
+          <p className="uninstall-note">
+            <HardDrive size={16} aria-hidden="true" />
+            <span>卸载默认保留设置、缓存和系统凭据，便于升级或重装；彻底移除前请先使用上方清理操作。</span>
+          </p>
         </div>
-      </section>
+      </details>
 
       <AcceptancePanel onRuntimeStatusChange={applyAcceptanceRuntimeStatus} />
 
@@ -948,19 +1090,6 @@ export function SettingsView(): JSX.Element {
         </div>
 
         <div className="button-row">
-          <button type="button" className="secondary" onClick={handleClearCache} disabled={saving}>
-            <Eraser size={16} />
-            清空缓存
-          </button>
-          <button
-            type="button"
-            className="secondary"
-            onClick={handleClearApiKey}
-            disabled={saving || apiKeyStatus === "missing"}
-          >
-            <KeyRound size={16} />
-            清除 Key
-          </button>
           <button type="button" className="secondary" onClick={handleCancelDraft} disabled={saving || !hasUnsavedChanges}>
             <RotateCcw size={16} />
             取消更改
@@ -1115,7 +1244,13 @@ function parsePopupWidthInput(value: string): number | null {
 }
 
 function formatErrorMessage(error: unknown, fallback: string): string {
-  return error instanceof Error && error.message.trim() ? error.message : fallback;
+  if (error instanceof Error && error.message.trim()) {
+    return error.message;
+  }
+  if (typeof error === "string" && error.trim()) {
+    return error;
+  }
+  return fallback;
 }
 
 function runtimeWarningDetail(warning: string): string {
@@ -1133,6 +1268,7 @@ function appSettingsEqual(left: AppSettings, right: AppSettings): boolean {
     left.cleanPdfText === right.cleanPdfText &&
     left.enableCache === right.enableCache &&
     left.enableSelectionPopup === right.enableSelectionPopup &&
+    left.enableAutomaticSelection === right.enableAutomaticSelection &&
     left.targetLanguage === right.targetLanguage &&
     left.popupWidth === right.popupWidth
   );

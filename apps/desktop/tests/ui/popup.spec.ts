@@ -149,6 +149,55 @@ for (const width of [320, 379, 380, 420, 640]) {
   });
 }
 
+test("keeps the native 440 by 66 selection popup entirely scrollbar-free", async ({ page }) => {
+  await page.setViewportSize({ width: 440, height: 66 });
+  await page.goto("/?view=popup&state=selection&fixture=unbroken");
+
+  const metrics = await page.evaluate(() => {
+    const shell = document.querySelector<HTMLElement>(".selection-shell");
+    const actions = document.querySelector<HTMLElement>(".selection-actions");
+    if (!shell || !actions) {
+      return null;
+    }
+    const elements = [document.documentElement, document.body, document.getElementById("root"), shell, actions]
+      .filter((element): element is HTMLElement => element instanceof HTMLElement);
+    return {
+      elementsFit: elements.every(
+        (element) =>
+          element.scrollWidth <= element.clientWidth + 1 &&
+          element.scrollHeight <= element.clientHeight + 1
+      ),
+      dimensions: elements.map((element) => ({
+        name:
+          element === document.documentElement
+            ? "html"
+            : element === document.body
+              ? "body"
+              : element.id || element.className,
+        clientWidth: element.clientWidth,
+        scrollWidth: element.scrollWidth,
+        clientHeight: element.clientHeight,
+        scrollHeight: element.scrollHeight
+      })),
+      viewportFits:
+        document.documentElement.scrollWidth <= window.innerWidth + 1 &&
+        document.documentElement.scrollHeight <= window.innerHeight + 1,
+      shellOverflow: getComputedStyle(shell).overflow,
+      documentOverflow: getComputedStyle(document.documentElement).overflow
+    };
+  });
+
+  expect(metrics?.elementsFit, JSON.stringify(metrics?.dimensions)).toBe(true);
+  expect(metrics).toMatchObject({
+    viewportFits: true,
+    shellOverflow: "hidden",
+    documentOverflow: "hidden"
+  });
+  for (const name of ["复制", "翻译", "关闭"]) {
+    await expect(page.getByRole("button", { name })).toBeVisible();
+  }
+});
+
 for (const fixture of ["long", "unbroken", "cjk", "emoji", "multiline", "rtl"]) {
   test(`keeps ${fixture} translated content bounded`, async ({ page }) => {
     await page.setViewportSize({ width: 420, height: 560 });

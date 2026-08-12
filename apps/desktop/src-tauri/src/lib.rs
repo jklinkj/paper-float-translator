@@ -1,6 +1,12 @@
+// The macOS watcher and acceptance implementation intentionally remains compiled on Windows so
+// its deterministic contract tests still run there. Platform-only entry points and imports are
+// therefore expected to be unused in a normal Windows library build.
+#![cfg_attr(target_os = "windows", allow(dead_code, unused_imports))]
+
 mod acceptance_diagnostics;
 mod acceptance_runtime;
 mod native_work_area;
+mod platform;
 mod popup_controller;
 mod popup_geometry;
 mod text_cleaning;
@@ -26,6 +32,7 @@ use acceptance_runtime::{
     TranslationCommitObservation, DEFAULT_ACCEPTANCE_CAPACITY, RAPID_PROBE_DELAY_MS,
 };
 use arboard::Clipboard;
+use atomic_write_file::AtomicWriteFile;
 #[cfg(test)]
 use popup_controller::POPUP_PROTOCOL_VERSION;
 use popup_controller::{
@@ -47,7 +54,7 @@ use std::{
     process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -96,6 +103,12 @@ const DEEPSEEK_CONNECT_TIMEOUT_SECS: u64 = 10;
 const DEEPSEEK_REQUEST_TIMEOUT_SECS: u64 = 45;
 const STREAM_UPDATE_THROTTLE_MS: u64 = 100;
 const CACHE_MAX_ENTRIES: usize = 500;
+const CACHE_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+const CACHE_FUTURE_SKEW_SECS: u64 = 5 * 60;
+#[cfg(target_os = "windows")]
+const WINDOWS_UIA_READ_TIMEOUT_MS: u64 = 450;
+#[cfg(target_os = "windows")]
+static WINDOWS_SELECTION_GENERATION: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "local-api-key-file")]
 const LOCAL_API_KEY_FILE_NAME: &str = "api-key.local";
 #[cfg(feature = "local-api-key-file")]
@@ -135,6 +148,7 @@ struct AppSettings {
     clean_pdf_text: bool,
     enable_cache: bool,
     enable_selection_popup: bool,
+    enable_automatic_selection: bool,
     target_language: String,
     popup_width: u32,
 }
@@ -147,6 +161,7 @@ impl Default for AppSettings {
             clean_pdf_text: true,
             enable_cache: true,
             enable_selection_popup: true,
+            enable_automatic_selection: cfg!(target_os = "macos"),
             target_language: DEFAULT_TARGET_LANGUAGE.to_string(),
             popup_width: 420,
         }
@@ -388,6 +403,7 @@ struct SettingsPayload {
     has_api_key: bool,
     api_key_status: ApiKeyStatus,
     api_key_storage: ApiKeyStorage,
+    runtime_platform: RuntimePlatform,
     double_copy_status: WatcherStatus,
     selection_status: WatcherStatus,
     capability_snapshot: CapabilitySnapshot,
@@ -410,8 +426,21 @@ enum ApiKeyStatus {
 enum ApiKeyStorage {
     #[cfg(feature = "local-api-key-file")]
     LocalFile,
-    #[cfg(not(feature = "local-api-key-file"))]
+    #[cfg(all(not(feature = "local-api-key-file"), not(target_os = "windows")))]
     SystemKeychain,
+    #[cfg(all(not(feature = "local-api-key-file"), target_os = "windows"))]
+    WindowsCredentialManager,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RuntimePlatform {
+    #[cfg(target_os = "macos")]
+    Macos,
+    #[cfg(target_os = "windows")]
+    Windows,
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    Other,
 }
 
 impl ApiKeyStatus {
@@ -430,6 +459,33 @@ struct Point {
 struct TriggerRecord {
     text: String,
     triggered_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionTriggerKind {
+    Automatic,
+    Deliberate,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SelectionIdentity {
+    source_pid: i32,
+    text_fingerprint: [u8; 32],
+}
+
+impl SelectionIdentity {
+    fn new(source_pid: i32, cleaned_text: &str) -> Self {
+        Self {
+            source_pid,
+            text_fingerprint: Sha256::digest(cleaned_text.as_bytes()).into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActivePopupSelection {
+    identity: SelectionIdentity,
+    selection_revision: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -469,6 +525,8 @@ struct InnerState {
     capability_snapshot: CapabilitySnapshot,
     last_double_copy_trigger: Option<TriggerRecord>,
     active_selection_text: Option<String>,
+    active_popup_selection: Option<ActivePopupSelection>,
+    dismissed_automatic_selection: Option<SelectionIdentity>,
     last_selection_read: Option<SelectionReadDiagnostics>,
     latched_selection_baseline_error: Option<String>,
     popup_positioned: bool,
@@ -481,6 +539,7 @@ struct InnerState {
 struct AppState {
     data_dir: PathBuf,
     inner: Arc<Mutex<InnerState>>,
+    startup_gate: Arc<StartupGate>,
     watcher_readiness: Arc<WatcherReadiness>,
     quitting: Arc<AtomicBool>,
     watcher_lifecycle: Arc<Mutex<()>>,
@@ -492,13 +551,43 @@ struct AppState {
     http: reqwest::Client,
 }
 
+#[derive(Default)]
+struct StartupGate {
+    ready: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl StartupGate {
+    fn wait(&self, timeout: Duration) -> Result<(), String> {
+        let ready = self.ready.lock().map_err(lock_error)?;
+        let (ready, result) = self
+            .changed
+            .wait_timeout_while(ready, timeout, |ready| !*ready)
+            .map_err(lock_error)?;
+        if *ready {
+            Ok(())
+        } else if result.timed_out() {
+            Err("应用初始化超时；请重新读取设置。".to_owned())
+        } else {
+            Err("应用初始化尚未完成；请重新读取设置。".to_owned())
+        }
+    }
+
+    fn mark_ready(&self) -> Result<(), String> {
+        let mut ready = self.ready.lock().map_err(lock_error)?;
+        *ready = true;
+        self.changed.notify_all();
+        Ok(())
+    }
+}
+
 impl Drop for AppState {
     fn drop(&mut self) {
         if let Ok(mut inner) = self.inner.lock() {
             log_popup_control_error(inner.popup_controller.cancel_translation());
             clear_active_selection(&mut inner);
         }
-        shutdown_macos_watchers(&self.quitting, &self.watcher_lifecycle);
+        shutdown_platform_watchers(&self.quitting, &self.watcher_lifecycle);
     }
 }
 
@@ -521,6 +610,7 @@ enum PopupCloseReason {
     OutsideClick,
     ExplicitClose,
     SelectionHandled,
+    ConfigurationChanged,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -557,7 +647,85 @@ pub fn run() {
     let watcher_lifecycle = Arc::new(Mutex::new(()));
     let setup_quitting = quitting.clone();
     let setup_watcher_lifecycle = watcher_lifecycle.clone();
-    let app = tauri::Builder::default()
+
+    #[cfg(feature = "acceptance-testing")]
+    let data_dir = match expected_acceptance_data_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("{error}");
+            return;
+        }
+    };
+    #[cfg(feature = "acceptance-testing")]
+    if let Err(error) = prepare_acceptance_data_dir(&data_dir) {
+        eprintln!("{error}");
+        return;
+    }
+    #[cfg(not(feature = "acceptance-testing"))]
+    let data_dir = dirs::data_dir()
+        .map(|path| path.join(EXPECTED_BUNDLE_IDENTIFIER))
+        .unwrap_or_else(fallback_data_dir);
+
+    let settings = match ensure_data_dir(&data_dir).and_then(|()| load_settings(&data_dir)) {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("{error}");
+            AppSettings {
+                enable_selection_popup: false,
+                ..AppSettings::default()
+            }
+        }
+    };
+    let inner = Arc::new(Mutex::new(InnerState {
+        settings,
+        popup_controller: PopupController::default(),
+        last_cleaned_text: String::new(),
+        last_cursor_point: None,
+        double_copy_status: initial_double_copy_status(),
+        selection_status: initial_selection_status(),
+        capability_snapshot: initial_capability_snapshot(),
+        last_double_copy_trigger: None,
+        active_selection_text: None,
+        active_popup_selection: None,
+        dismissed_automatic_selection: None,
+        last_selection_read: None,
+        latched_selection_baseline_error: None,
+        popup_positioned: false,
+        popup_dragging: false,
+        popup_focus_return_target: None,
+        acceptance_rapid_probe: None,
+        last_acceptance_probe_commit: None,
+    }));
+    let watcher_readiness = Arc::new(WatcherReadiness::default());
+    let startup_gate = Arc::new(StartupGate::default());
+    let acceptance = Arc::new(Mutex::new(
+        AcceptanceRuntime::from_environment(DEFAULT_ACCEPTANCE_CAPACITY)
+            .expect("failed to initialize bounded acceptance diagnostics"),
+    ));
+    let setup_inner = inner.clone();
+    let setup_watcher_readiness = watcher_readiness.clone();
+    let setup_startup_gate = startup_gate.clone();
+    let builder = platform::configure_builder(
+        tauri::Builder::default().manage(AppState {
+            data_dir,
+            inner,
+            startup_gate,
+            watcher_readiness,
+            quitting: setup_quitting.clone(),
+            watcher_lifecycle: setup_watcher_lifecycle.clone(),
+            acceptance,
+            acceptance_probe_epoch: AtomicU64::new(1),
+            #[cfg(feature = "acceptance-testing")]
+            acceptance_injection_epoch: Arc::new(AtomicU64::new(1)),
+            watcher_transition: tauri::async_runtime::Mutex::new(()),
+            http: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(DEEPSEEK_CONNECT_TIMEOUT_SECS))
+                .timeout(Duration::from_secs(DEEPSEEK_REQUEST_TIMEOUT_SECS))
+                .build()
+                .expect("failed to build DeepSeek HTTP client"),
+        }),
+    );
+    let app = builder
         .invoke_handler(tauri::generate_handler![
             get_settings,
             save_settings,
@@ -597,76 +765,33 @@ pub fn run() {
             ) {
                 return Err(std::io::Error::other(error).into());
             }
-            #[cfg(feature = "acceptance-testing")]
-            let data_dir = match app.path().app_data_dir() {
-                Ok(path) => path,
+
+            let managed_data_dir = app.state::<AppState>().data_dir.clone();
+            match app.path().app_data_dir() {
+                Ok(resolved_data_dir) if resolved_data_dir != managed_data_dir => {
+                    return Err(std::io::Error::other(format!(
+                        "应用数据目录不一致：预注册 {}，运行时解析 {}。",
+                        managed_data_dir.display(),
+                        resolved_data_dir.display()
+                    ))
+                    .into());
+                }
+                Ok(_) => {}
                 Err(error) => {
+                    #[cfg(feature = "acceptance-testing")]
                     return Err(std::io::Error::other(format!(
                         "验收数据目录解析失败，已阻止访问正式用户状态：{error}"
                     ))
                     .into());
+                    #[cfg(not(feature = "acceptance-testing"))]
+                    eprintln!(
+                        "应用数据目录运行时解析失败；继续使用预注册目录 {}：{error}",
+                        managed_data_dir.display()
+                    );
                 }
-            };
-            #[cfg(feature = "acceptance-testing")]
-            if let Err(error) = prepare_acceptance_data_dir(&data_dir) {
-                return Err(std::io::Error::other(error).into());
             }
-            #[cfg(not(feature = "acceptance-testing"))]
-            let data_dir = app
-                .path()
-                .app_data_dir()
-                .unwrap_or_else(|_| fallback_data_dir());
-            let settings = match ensure_data_dir(&data_dir).and_then(|()| load_settings(&data_dir))
-            {
-                Ok(settings) => settings,
-                Err(error) => {
-                    eprintln!("{error}");
-                    AppSettings {
-                        enable_selection_popup: false,
-                        ..AppSettings::default()
-                    }
-                }
-            };
-            let inner = Arc::new(Mutex::new(InnerState {
-                settings,
-                popup_controller: PopupController::default(),
-                last_cleaned_text: String::new(),
-                last_cursor_point: None,
-                double_copy_status: initial_double_copy_status(),
-                selection_status: initial_selection_status(),
-                capability_snapshot: initial_capability_snapshot(),
-                last_double_copy_trigger: None,
-                active_selection_text: None,
-                last_selection_read: None,
-                latched_selection_baseline_error: None,
-                popup_positioned: false,
-                popup_dragging: false,
-                popup_focus_return_target: None,
-                acceptance_rapid_probe: None,
-                last_acceptance_probe_commit: None,
-            }));
-            let watcher_readiness = Arc::new(WatcherReadiness::default());
-            let acceptance = Arc::new(Mutex::new(
-                AcceptanceRuntime::from_environment(DEFAULT_ACCEPTANCE_CAPACITY)
-                    .expect("failed to initialize bounded acceptance diagnostics"),
-            ));
-            app.manage(AppState {
-                data_dir,
-                inner: inner.clone(),
-                watcher_readiness: watcher_readiness.clone(),
-                quitting: setup_quitting.clone(),
-                watcher_lifecycle: setup_watcher_lifecycle.clone(),
-                acceptance,
-                acceptance_probe_epoch: AtomicU64::new(1),
-                #[cfg(feature = "acceptance-testing")]
-                acceptance_injection_epoch: Arc::new(AtomicU64::new(1)),
-                watcher_transition: tauri::async_runtime::Mutex::new(()),
-                http: reqwest::Client::builder()
-                    .connect_timeout(Duration::from_secs(DEEPSEEK_CONNECT_TIMEOUT_SECS))
-                    .timeout(Duration::from_secs(DEEPSEEK_REQUEST_TIMEOUT_SECS))
-                    .build()
-                    .expect("failed to build DeepSeek HTTP client"),
-            });
+
+            platform::setup(app, setup_quitting.clone())?;
 
             if let Some(popup) = app.get_webview_window("popup") {
                 let _ = popup.hide();
@@ -686,22 +811,30 @@ pub fn run() {
                 });
             }
 
-            if let Err(error) = restart_macos_watchers(
+            if let Err(error) = restart_platform_watchers(
                 app.handle().clone(),
-                inner,
-                watcher_readiness,
+                setup_inner,
+                setup_watcher_readiness,
                 &setup_quitting,
                 &setup_watcher_lifecycle,
             ) {
                 eprintln!("{error}");
             }
+            setup_startup_gate
+                .mark_ready()
+                .map_err(std::io::Error::other)?;
             Ok(())
         })
         .build(context)
         .expect("failed to build Paper Float Translator");
     app.run(move |app_handle, event| match event {
-        RunEvent::ExitRequested { .. } => {
-            shutdown_macos_watchers(&quitting, &watcher_lifecycle);
+        RunEvent::ExitRequested { code, api, .. } => {
+            if should_keep_background_agent_running(code, quitting.load(Ordering::Acquire)) {
+                api.prevent_exit();
+                return;
+            }
+            platform::shutdown(app_handle);
+            shutdown_platform_watchers(&quitting, &watcher_lifecycle);
         }
         #[cfg(target_os = "macos")]
         RunEvent::Reopen {
@@ -718,11 +851,425 @@ fn should_hide_settings_window_on_close(is_quitting: bool) -> bool {
     !is_quitting
 }
 
-fn show_settings_window(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("settings") {
-        let _ = window.show();
-        let _ = window.set_focus();
+fn should_keep_background_agent_running(exit_code: Option<i32>, is_quitting: bool) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        exit_code.is_none() && !is_quitting
     }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (exit_code, is_quitting);
+        false
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn show_settings_window(app: &AppHandle) {
+    platform::show_settings_window(app);
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn handle_windows_selection_shortcut(app: &AppHandle) {
+    let app_state = app.state::<AppState>();
+    let enabled = app_state
+        .inner
+        .lock()
+        .ok()
+        .is_some_and(|inner| inner.settings.enable_selection_popup);
+    if !enabled || app_state.quitting.load(Ordering::Acquire) {
+        return;
+    }
+    if let Ok(mut inner) = app_state.inner.lock() {
+        inner.dismissed_automatic_selection = None;
+    }
+
+    let Some(generation) = next_windows_selection_generation() else {
+        update_windows_selection_error(app, platform::WindowsSelectionError::WorkerStopped);
+        return;
+    };
+
+    let anchor = windows_cursor_logical_anchor(app);
+    let reader = app
+        .state::<platform::WindowsSelectionReader>()
+        .inner()
+        .clone();
+    let worker_app = app.clone();
+    let spawn_result = std::thread::Builder::new()
+        .name("paper-float-windows-selection-trigger".to_owned())
+        .spawn(move || {
+            match reader.read(
+                generation,
+                Duration::from_millis(WINDOWS_UIA_READ_TIMEOUT_MS),
+            ) {
+                Ok(selection) => handle_windows_selection_result(
+                    &worker_app,
+                    selection,
+                    anchor,
+                    WindowsSelectionTrigger::Shortcut,
+                ),
+                Err(error) => update_windows_selection_error(&worker_app, error),
+            }
+        });
+    if spawn_result.is_err() {
+        update_windows_selection_error(app, platform::WindowsSelectionError::WorkerStopped);
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy)]
+enum WindowsSelectionTrigger {
+    Shortcut,
+    Automatic,
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn handle_windows_automatic_selection_trigger(app: &AppHandle, source_pid: i32) {
+    if windows_cursor_logical_anchor(app).is_some_and(|point| is_point_inside_popup(app, point)) {
+        return;
+    }
+    let _ = platform::request_windows_automatic_selection(app, source_pid);
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn handle_windows_global_mouse_down(app: &AppHandle) {
+    platform::cancel_windows_automatic_selection(app);
+    hide_popup_if_unpinned(
+        app,
+        &app.state::<AppState>().inner,
+        windows_cursor_logical_anchor(app),
+    );
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn handle_windows_global_keyboard_input(app: &AppHandle) {
+    platform::cancel_windows_automatic_selection(app);
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn handle_windows_automatic_selection_cleared(app: &AppHandle, focused_source_pid: i32) {
+    if !should_clear_automatic_dismissal_for_focus(focused_source_pid, std::process::id() as i32) {
+        return;
+    }
+    let state = app.state::<AppState>();
+    if let Ok(mut inner) = state.inner.lock() {
+        inner.dismissed_automatic_selection = None;
+    };
+}
+
+fn should_clear_automatic_dismissal_for_focus(
+    focused_source_pid: i32,
+    translator_pid: i32,
+) -> bool {
+    focused_source_pid > 0 && focused_source_pid != translator_pid
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn handle_windows_automatic_selection(text: String, source_pid: i32, app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let enabled = state.inner.lock().ok().is_some_and(|inner| {
+        inner.settings.enable_selection_popup && inner.settings.enable_automatic_selection
+    });
+    if !enabled || state.quitting.load(Ordering::Acquire) {
+        return;
+    }
+    let Some(generation) = next_windows_selection_generation() else {
+        handle_windows_automatic_selection_error(
+            app,
+            platform::WindowsSelectionError::WorkerStopped,
+        );
+        return;
+    };
+    let selection = platform::WindowsSelection {
+        generation,
+        text,
+        source_pid,
+    };
+    handle_windows_selection_result(
+        app,
+        selection,
+        windows_cursor_logical_anchor(app),
+        WindowsSelectionTrigger::Automatic,
+    );
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn handle_windows_automatic_selection_error(
+    app: &AppHandle,
+    error: platform::WindowsSelectionError,
+) {
+    let state = app.state::<AppState>();
+    if let Ok(mut inner) = state.inner.lock() {
+        if !inner.settings.enable_selection_popup || !inner.settings.enable_automatic_selection {
+            return;
+        }
+        inner.selection_status = WatcherStatus::with_code(
+            true,
+            true,
+            format!(
+                "自动划词本次未能读取选区（{}）；Ctrl+Alt+T 与 Ctrl+C+C 仍可使用。",
+                error.code()
+            ),
+            error.code(),
+        );
+        inner.capability_snapshot.mouse_tap =
+            RuntimeCapabilityState::with_status(CapabilityHealth::Degraded, error.code());
+        inner.capability_snapshot.ax_selected_text_observer =
+            RuntimeCapabilityState::with_status(CapabilityHealth::Degraded, error.code());
+    };
+}
+
+#[cfg(target_os = "windows")]
+fn next_windows_selection_generation() -> Option<i64> {
+    WINDOWS_SELECTION_GENERATION
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current < i64::MAX as u64).then_some(current + 1)
+        })
+        .ok()
+        .and_then(|previous| i64::try_from(previous + 1).ok())
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn handle_windows_double_copy_selection(
+    app: &AppHandle,
+    selection: platform::WindowsDoubleCopySelection,
+) {
+    let state = app.state::<AppState>();
+    let enabled = state
+        .inner
+        .lock()
+        .ok()
+        .is_some_and(|inner| inner.settings.enable_selection_popup);
+    if !enabled || state.quitting.load(Ordering::Acquire) {
+        return;
+    }
+    if selection.source_pid > 0 && selection.source_pid == std::process::id() as i32 {
+        return;
+    }
+
+    let anchor = selection
+        .physical_anchor
+        .and_then(|(x, y)| windows_physical_anchor_to_logical(app, f64::from(x), f64::from(y)))
+        .or_else(|| windows_default_logical_anchor(app));
+    let Some(anchor) = anchor else {
+        if let Ok(mut inner) = state.inner.lock() {
+            inner.double_copy_status = WatcherStatus::with_code(
+                true,
+                true,
+                "已确认双复制，但无法确定浮窗所在屏幕，请重试。",
+                "windows_double_copy_anchor_unavailable",
+            );
+        }
+        return;
+    };
+
+    if let Ok(mut inner) = state.inner.lock() {
+        inner.dismissed_automatic_selection = None;
+        inner.double_copy_status = WatcherStatus::with_code(
+            true,
+            true,
+            "Ctrl+C+C 双复制取词已就绪。",
+            "windows_double_copy_ready",
+        );
+        inner.capability_snapshot.key_tap =
+            RuntimeCapabilityState::with_status(CapabilityHealth::Ready, "windows_raw_input_ready");
+        inner.capability_snapshot.clipboard_double_copy_fallback =
+            RuntimeCapabilityState::with_status(
+                CapabilityHealth::Ready,
+                "windows_double_copy_ready",
+            );
+    }
+    handle_confirmed_double_copy(app.clone(), state.inner.clone(), selection.text, anchor);
+}
+
+#[cfg(target_os = "windows")]
+fn handle_windows_selection_result(
+    app: &AppHandle,
+    selection: platform::WindowsSelection,
+    anchor: Option<Point>,
+    trigger: WindowsSelectionTrigger,
+) {
+    if selection.source_pid > 0 && selection.source_pid == std::process::id() as i32 {
+        update_windows_selection_runtime_status(
+            app,
+            true,
+            true,
+            "已忽略翻译器自身窗口中的选区。",
+            "windows_uia_self_ignored",
+            CapabilityHealth::Ready,
+        );
+        return;
+    }
+
+    let Some(anchor) = anchor.or_else(|| windows_default_logical_anchor(app)) else {
+        update_windows_selection_runtime_status(
+            app,
+            true,
+            true,
+            "已读取选中文本，但无法确定浮窗所在屏幕，请重试。",
+            "windows_anchor_unavailable",
+            CapabilityHealth::Degraded,
+        );
+        return;
+    };
+
+    let state = app.state::<AppState>();
+    if let Ok(mut inner) = state.inner.lock() {
+        inner.selection_status = match trigger {
+            WindowsSelectionTrigger::Shortcut => WatcherStatus::with_code(
+                true,
+                true,
+                format!(
+                    "Windows UI Automation 取词正常；快捷键为 {}。",
+                    platform::WINDOWS_SELECTION_SHORTCUT_LABEL
+                ),
+                "windows_uia_read_ready",
+            ),
+            WindowsSelectionTrigger::Automatic => WatcherStatus::with_code(
+                true,
+                true,
+                "Windows 自动划词已读取当前选区；不会改写剪贴板。",
+                "windows_auto_selection_read_ready",
+            ),
+        };
+        inner.capability_snapshot.direct_selection_read =
+            RuntimeCapabilityState::with_status(CapabilityHealth::Ready, "windows_uia_read_ready");
+    }
+    show_selection_popup(
+        app,
+        &state.inner,
+        selection.text,
+        anchor,
+        selection.generation,
+        selection.source_pid,
+        match trigger {
+            WindowsSelectionTrigger::Shortcut => SelectionTriggerKind::Deliberate,
+            WindowsSelectionTrigger::Automatic => SelectionTriggerKind::Automatic,
+        },
+    );
+}
+
+#[cfg(target_os = "windows")]
+fn update_windows_selection_error(app: &AppHandle, error: platform::WindowsSelectionError) {
+    let (available, running, health) = match error {
+        platform::WindowsSelectionError::UiAutomationUnavailable
+        | platform::WindowsSelectionError::WorkerStopped => {
+            (false, false, CapabilityHealth::Unavailable)
+        }
+        platform::WindowsSelectionError::PatternUnavailable
+        | platform::WindowsSelectionError::Busy
+        | platform::WindowsSelectionError::Timeout => (true, true, CapabilityHealth::Degraded),
+        platform::WindowsSelectionError::EmptySelection
+        | platform::WindowsSelectionError::SelectionTooLarge
+        | platform::WindowsSelectionError::SecureField => (true, true, CapabilityHealth::Ready),
+    };
+    update_windows_selection_runtime_status(
+        app,
+        available,
+        running,
+        error.message(),
+        error.code(),
+        health,
+    );
+}
+
+#[cfg(target_os = "windows")]
+fn update_windows_selection_runtime_status(
+    app: &AppHandle,
+    available: bool,
+    running: bool,
+    message: &str,
+    code: &str,
+    health: CapabilityHealth,
+) {
+    let state = app.state::<AppState>();
+    if let Ok(mut inner) = state.inner.lock() {
+        inner.selection_status = WatcherStatus::with_code(available, running, message, code);
+        inner.capability_snapshot.direct_selection_read =
+            RuntimeCapabilityState::with_status(health, code);
+    };
+}
+
+#[cfg(target_os = "windows")]
+fn windows_cursor_logical_anchor(app: &AppHandle) -> Option<Point> {
+    let window = app.get_webview_window("popup")?;
+    let cursor = window.cursor_position().ok()?;
+    windows_physical_anchor_to_logical(app, cursor.x, cursor.y)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_physical_anchor_to_logical(
+    app: &AppHandle,
+    physical_x: f64,
+    physical_y: f64,
+) -> Option<Point> {
+    let window = app.get_webview_window("popup")?;
+    window
+        .available_monitors()
+        .ok()?
+        .into_iter()
+        .find_map(|monitor| {
+            windows_physical_to_monitor_logical(
+                physical_x,
+                physical_y,
+                PhysicalPoint {
+                    x: monitor.position().x,
+                    y: monitor.position().y,
+                },
+                GeometryPhysicalSize {
+                    width: monitor.size().width,
+                    height: monitor.size().height,
+                },
+                monitor.scale_factor(),
+            )
+        })
+}
+
+#[cfg(target_os = "windows")]
+fn windows_default_logical_anchor(app: &AppHandle) -> Option<Point> {
+    let window = app.get_webview_window("popup")?;
+    let monitor = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| window.primary_monitor().ok().flatten())?;
+    let center = monitor_logical_center(&monitor)?;
+    Some(Point {
+        x: center.x,
+        y: center.y,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn windows_physical_to_monitor_logical(
+    physical_x: f64,
+    physical_y: f64,
+    monitor_origin: PhysicalPoint,
+    monitor_size: GeometryPhysicalSize,
+    scale_factor: f64,
+) -> Option<Point> {
+    if !physical_x.is_finite()
+        || !physical_y.is_finite()
+        || !scale_factor.is_finite()
+        || scale_factor <= 0.0
+        || monitor_size.width == 0
+        || monitor_size.height == 0
+    {
+        return None;
+    }
+    let origin_x = monitor_origin.x as f64;
+    let origin_y = monitor_origin.y as f64;
+    if physical_x < origin_x
+        || physical_y < origin_y
+        || physical_x >= origin_x + monitor_size.width as f64
+        || physical_y >= origin_y + monitor_size.height as f64
+    {
+        return None;
+    }
+    Some(Point {
+        x: origin_x / scale_factor + (physical_x - origin_x) / scale_factor,
+        y: origin_y / scale_factor + (physical_y - origin_y) / scale_factor,
+    })
 }
 
 #[tauri::command]
@@ -730,6 +1277,7 @@ async fn get_settings(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<SettingsPayload, String> {
+    state.startup_gate.wait(Duration::from_secs(2))?;
     let _transition = state.watcher_transition.lock().await;
     ensure_data_dir(&state.data_dir)?;
     let persisted_settings = load_settings(&state.data_dir)?;
@@ -764,7 +1312,7 @@ async fn refresh_watcher_status(
         // Preserve the last external selection attempt so a diagnostics
         // refresh cannot erase the Preview failure it is meant to inspect.
         if !selection_enabled {
-            match commit_popup_close(&mut inner, PopupCloseReason::OutsideClick) {
+            match commit_popup_close(&mut inner, PopupCloseReason::ConfigurationChanged) {
                 Ok(snapshot) => hidden_snapshot = Some(snapshot),
                 Err(error) => runtime_warnings.push(format!(
                     "已读取磁盘设置，但关闭现有划词浮窗失败：{}",
@@ -778,11 +1326,11 @@ async fn refresh_watcher_status(
             &app,
             &state.inner,
             &snapshot,
-            PopupCloseReason::OutsideClick,
+            PopupCloseReason::ConfigurationChanged,
         );
     }
 
-    let generation = match restart_macos_watchers(
+    let generation = match restart_platform_watchers(
         app.clone(),
         state.inner.clone(),
         state.watcher_readiness.clone(),
@@ -906,6 +1454,7 @@ fn current_settings_payload(
         has_api_key: api_key_status.has_api_key(),
         api_key_status,
         api_key_storage: compiled_api_key_storage(),
+        runtime_platform: compiled_runtime_platform(),
         double_copy_status,
         selection_status,
         capability_snapshot,
@@ -1248,10 +1797,17 @@ async fn save_settings(
         .map_err(lock_error)?
         .settings
         .enable_selection_popup;
+    let previous_automatic_selection_enabled = state
+        .inner
+        .lock()
+        .map_err(lock_error)?
+        .settings
+        .enable_automatic_selection;
     let restart_required = selection_setting_requires_restart(
         previous_selection_enabled,
         normalized.enable_selection_popup,
-    );
+    ) || previous_automatic_selection_enabled
+        != normalized.enable_automatic_selection;
     save_managed_json(
         &state.data_dir,
         &settings_path(&state.data_dir),
@@ -1284,7 +1840,7 @@ async fn save_settings(
             inner.capability_snapshot = initial_capability_snapshot();
         }
         if !inner.settings.enable_selection_popup {
-            match commit_popup_close(&mut inner, PopupCloseReason::OutsideClick) {
+            match commit_popup_close(&mut inner, PopupCloseReason::ConfigurationChanged) {
                 Ok(snapshot) => hidden_snapshot = Some(snapshot),
                 Err(error) => runtime_warnings.push(format!(
                     "设置已保存，但关闭现有划词浮窗失败：{}",
@@ -1298,13 +1854,13 @@ async fn save_settings(
             &app,
             &state.inner,
             &snapshot,
-            PopupCloseReason::OutsideClick,
+            PopupCloseReason::ConfigurationChanged,
         );
     }
     resize_existing_popup_to_settings(&app, &state.inner);
 
     if restart_required {
-        let generation = match restart_macos_watchers(
+        let generation = match restart_platform_watchers(
             app.clone(),
             state.inner.clone(),
             state.watcher_readiness.clone(),
@@ -1435,7 +1991,7 @@ fn apply_watcher_restart_failure(
     code: &str,
 ) -> Result<(), String> {
     if !selection_enabled {
-        stop_macos_watchers_ordered(quitting, watcher_lifecycle);
+        stop_platform_watchers_ordered(quitting, watcher_lifecycle);
         return enforce_selection_disabled_after_restart_failure(inner, code);
     }
 
@@ -1510,7 +2066,7 @@ fn enforce_selection_disabled_after_timeout(
     // Native stop is queued on the macOS main queue. The following resource
     // snapshot performs a synchronous main-queue read and therefore acts as the
     // release barrier for that stop request.
-    stop_macos_watchers_ordered(quitting, watcher_lifecycle);
+    stop_platform_watchers_ordered(quitting, watcher_lifecycle);
     #[cfg(target_os = "macos")]
     let released_after_stop = macos_native::resource_snapshot()
         .map(|(_, resources)| selection_resources_released(resources))
@@ -1687,7 +2243,7 @@ async fn copy_source(app: AppHandle, state: State<'_, AppState>) -> Result<(), S
             .or_else(|| inner.popup_controller.snapshot().cleaned_text.clone());
         let hidden_snapshot = if text.is_some() {
             Some(
-                commit_popup_close(&mut inner, PopupCloseReason::SelectionHandled)
+                commit_popup_close(&mut inner, PopupCloseReason::ExplicitClose)
                     .map_err(popup_control_error)?,
             )
         } else {
@@ -1700,7 +2256,7 @@ async fn copy_source(app: AppHandle, state: State<'_, AppState>) -> Result<(), S
             &app,
             &state.inner,
             &snapshot,
-            PopupCloseReason::SelectionHandled,
+            PopupCloseReason::ExplicitClose,
         );
     }
     if let Some(text) = text {
@@ -1766,6 +2322,10 @@ async fn translate_selection(app: AppHandle, state: State<'_, AppState>) -> Resu
         (cleaned, target_language, mode, selection_revision)
     };
     if let Some(cleaned) = cleaned {
+        #[cfg(target_os = "windows")]
+        if let Some(window) = app.get_webview_window("popup") {
+            let _ = window.set_focusable(true);
+        }
         translate_text(
             app,
             TranslateContext {
@@ -2062,7 +2622,7 @@ async fn translate_text(
                 mode: mode.clone(),
                 target_language: target_language.clone(),
                 glossary_version,
-                created_at: iso_now(),
+                created_at: cache_timestamp_now(),
             },
         );
     }
@@ -2101,7 +2661,7 @@ where
     operation()
 }
 
-fn start_macos_watchers(
+fn start_platform_watchers(
     app: AppHandle,
     inner: Arc<Mutex<InnerState>>,
     readiness: Arc<WatcherReadiness>,
@@ -2113,7 +2673,99 @@ fn start_macos_watchers(
         macos_native::start(app, inner, readiness, generation);
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        let registered = platform::windows_selection_shortcut_registered();
+        let (enabled, automatic_selection_enabled) = {
+            let guard = inner.lock().map_err(lock_error)?;
+            (
+                guard.settings.enable_selection_popup,
+                guard.settings.enable_automatic_selection,
+            )
+        };
+        platform::set_windows_input_monitor_enabled(&app, enabled);
+        let input_running = platform::windows_input_monitor_running(&app);
+        let automatic_requested = enabled && automatic_selection_enabled;
+        let automatic_configuration =
+            platform::set_windows_automatic_selection_enabled(&app, automatic_requested);
+        if let Err(error) = &automatic_configuration {
+            eprintln!("windows_selection.automatic_configuration_failed: {error}");
+        }
+        let automatic_running = automatic_configuration.unwrap_or(false)
+            && platform::windows_automatic_selection_running(&app);
+        if let Ok(mut guard) = inner.lock() {
+            let enabled = guard.settings.enable_selection_popup;
+            guard.double_copy_status = WatcherStatus::with_code(
+                false,
+                false,
+                format!(
+                    "Windows 双复制兜底尚未启用；当前请使用 {}。",
+                    platform::WINDOWS_SELECTION_SHORTCUT_LABEL
+                ),
+                "windows_double_copy_pending",
+            );
+            guard.selection_status = if !enabled {
+                WatcherStatus::with_code(
+                    true,
+                    false,
+                    "Windows 快捷键取词已在设置中关闭。",
+                    "selection_disabled",
+                )
+            } else if registered && automatic_requested && automatic_running {
+                WatcherStatus::with_code(
+                    true,
+                    true,
+                    format!(
+                        "Windows 鼠标划词与快捷键取词已就绪；快捷键为 {}。",
+                        platform::WINDOWS_SELECTION_SHORTCUT_LABEL
+                    ),
+                    "windows_auto_selection_ready",
+                )
+            } else if registered && automatic_requested {
+                WatcherStatus::with_code(
+                    true,
+                    true,
+                    format!(
+                        "自动划词监听未能完整启动；仍可使用 {} 与 Ctrl+C+C。",
+                        platform::WINDOWS_SELECTION_SHORTCUT_LABEL
+                    ),
+                    "windows_auto_selection_degraded",
+                )
+            } else if registered {
+                WatcherStatus::with_code(
+                    true,
+                    true,
+                    format!(
+                        "Windows 快捷键取词已就绪：选中文字后按 {}。",
+                        platform::WINDOWS_SELECTION_SHORTCUT_LABEL
+                    ),
+                    "windows_uia_shortcut_ready",
+                )
+            } else {
+                WatcherStatus::with_code(
+                    false,
+                    false,
+                    format!(
+                        "无法注册 {}；该快捷键可能已被其他应用占用。",
+                        platform::WINDOWS_SELECTION_SHORTCUT_LABEL
+                    ),
+                    "windows_shortcut_registration_failed",
+                )
+            };
+            guard.double_copy_status = windows_double_copy_status(enabled, input_running);
+            guard.capability_snapshot = windows_shortcut_capability_snapshot(
+                enabled,
+                registered,
+                input_running,
+                automatic_selection_enabled,
+                automatic_running,
+            );
+        }
+        readiness.observe(generation, WatcherSource::Pasteboard)?;
+        readiness.observe(generation, WatcherSource::Selection)?;
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = app;
         if let Ok(mut guard) = inner.lock() {
@@ -2137,7 +2789,7 @@ fn start_macos_watchers(
     Ok(generation)
 }
 
-fn restart_macos_watchers(
+fn restart_platform_watchers(
     app: AppHandle,
     inner: Arc<Mutex<InnerState>>,
     readiness: Arc<WatcherReadiness>,
@@ -2147,8 +2799,8 @@ fn restart_macos_watchers(
     execute_watcher_restart_if_running(
         quitting,
         watcher_lifecycle,
-        || start_macos_watchers(app, inner, readiness),
-        stop_macos_watchers_native,
+        || start_platform_watchers(app, inner, readiness),
+        stop_platform_watchers_native,
     )
 }
 
@@ -2260,15 +2912,15 @@ fn apply_watcher_refresh_timeout(inner: &mut InnerState, missing: MissingWatcher
     }
 }
 
-fn stop_macos_watchers_ordered(quitting: &AtomicBool, watcher_lifecycle: &Mutex<()>) {
-    execute_watcher_stop_ordered(quitting, watcher_lifecycle, stop_macos_watchers_native);
+fn stop_platform_watchers_ordered(quitting: &AtomicBool, watcher_lifecycle: &Mutex<()>) {
+    execute_watcher_stop_ordered(quitting, watcher_lifecycle, stop_platform_watchers_native);
 }
 
-fn shutdown_macos_watchers(quitting: &AtomicBool, watcher_lifecycle: &Mutex<()>) {
-    execute_watcher_shutdown(quitting, watcher_lifecycle, stop_macos_watchers_native);
+fn shutdown_platform_watchers(quitting: &AtomicBool, watcher_lifecycle: &Mutex<()>) {
+    execute_watcher_shutdown(quitting, watcher_lifecycle, stop_platform_watchers_native);
 }
 
-fn stop_macos_watchers_native() {
+fn stop_platform_watchers_native() {
     #[cfg(target_os = "macos")]
     {
         macos_native::stop();
@@ -2936,6 +3588,7 @@ mod macos_native {
                 anchor,
                 delta,
                 target_pid,
+                SelectionTriggerKind::Automatic,
             ),
             EVENT_POPUP_ESCAPE => close_popup_from_global_escape(&context.app, &context.inner),
             EVENT_POPUP_FOCUS_REQUEST => {
@@ -3438,6 +4091,7 @@ fn show_selection_popup(
     anchor: Point,
     native_generation: i64,
     source_pid: i32,
+    trigger: SelectionTriggerKind,
 ) {
     let acceptance_text = raw_text.clone();
     let prepared = {
@@ -3445,7 +4099,14 @@ fn show_selection_popup(
             Ok(value) => value,
             Err(_) => return,
         };
-        prepare_selection_popup_locked(&mut guard, raw_text, anchor, native_generation, source_pid)
+        prepare_selection_popup_locked(
+            &mut guard,
+            raw_text,
+            anchor,
+            native_generation,
+            source_pid,
+            trigger,
+        )
     };
     match prepared {
         Ok(Some(state)) => {
@@ -3755,6 +4416,7 @@ fn prepare_selection_popup_locked(
     anchor: Point,
     native_generation: i64,
     source_pid: i32,
+    trigger: SelectionTriggerKind,
 ) -> Result<Option<PopupState>, PopupControlError> {
     if !inner.settings.enable_selection_popup {
         inner
@@ -3765,11 +4427,24 @@ fn prepare_selection_popup_locked(
     }
     let cleaned = clean_selected_text(&raw_text, inner.settings.clean_pdf_text);
     if cleaned.is_empty() {
+        if trigger == SelectionTriggerKind::Automatic {
+            inner.dismissed_automatic_selection = None;
+        }
         inner
             .popup_controller
             .accept_native_generation(native_generation)?;
         return Ok(None);
     }
+    let identity = SelectionIdentity::new(source_pid, &cleaned);
+    if trigger == SelectionTriggerKind::Automatic
+        && inner.dismissed_automatic_selection.as_ref() == Some(&identity)
+    {
+        inner
+            .popup_controller
+            .accept_native_generation(native_generation)?;
+        return Ok(None);
+    }
+    inner.dismissed_automatic_selection = None;
     let next = PopupState {
         status: PopupStatus::SelectionReady,
         source_text: Some(raw_text),
@@ -3784,6 +4459,10 @@ fn prepare_selection_popup_locked(
     let selection_revision = state.selection_revision;
     inner.last_cleaned_text = cleaned.clone();
     inner.active_selection_text = Some(cleaned);
+    inner.active_popup_selection = Some(ActivePopupSelection {
+        identity,
+        selection_revision,
+    });
     inner.last_cursor_point = Some(anchor);
     inner.popup_focus_return_target = (source_pid > 0).then_some(PopupFocusReturnTarget {
         selection_revision,
@@ -3817,6 +4496,8 @@ fn show_selection_pending(
         let state = guard.popup_controller.commit_new_selection(next)?;
         guard.last_cleaned_text = cleaned_text;
         guard.active_selection_text = None;
+        guard.active_popup_selection = None;
+        guard.dismissed_automatic_selection = None;
         guard.popup_focus_return_target = None;
         state
     };
@@ -3840,6 +4521,7 @@ fn show_popup(
         };
         let state = guard.popup_controller.commit_new_selection(state)?;
         guard.popup_focus_return_target = None;
+        guard.active_popup_selection = None;
         clear_active_selection(&mut guard);
         state
     };
@@ -3873,6 +4555,10 @@ fn show_committed_popup(app: &AppHandle, inner: &Arc<Mutex<InnerState>>, state: 
     drop(current);
     remember_current_external_focus_target(inner, state);
     if let Some(window) = app.get_webview_window("popup") {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = window.set_focusable(!state.status.is_selection_prompt());
+        }
         let _ = window.show();
         if should_focus {
             if state.status.is_selection_prompt() {
@@ -4164,12 +4850,12 @@ fn try_position_popup(app: &AppHandle, inner: &Arc<Mutex<InnerState>>) -> bool {
     let Some(window) = app.get_webview_window("popup") else {
         return false;
     };
-    let Some(monitor) = window.monitor_from_point(anchor.x, anchor.y).ok().flatten() else {
-        return false;
-    };
     let logical_anchor = LogicalPoint {
         x: anchor.x,
         y: anchor.y,
+    };
+    let Some(monitor) = monitor_for_logical_point(&window, logical_anchor) else {
+        return false;
     };
     let Some(monitor) = monitor_geometry(&monitor, logical_anchor) else {
         return false;
@@ -4192,6 +4878,39 @@ fn try_position_popup(app: &AppHandle, inner: &Arc<Mutex<InnerState>>) -> bool {
     window
         .set_position(PhysicalPosition::new(position.x, position.y))
         .is_ok()
+}
+
+fn monitor_for_logical_point(
+    window: &WebviewWindow,
+    point: LogicalPoint,
+) -> Option<tauri::Monitor> {
+    #[cfg(target_os = "windows")]
+    {
+        window
+            .available_monitors()
+            .ok()?
+            .into_iter()
+            .find(|monitor| {
+                let scale_factor = monitor.scale_factor();
+                logical_point_is_inside_monitor(
+                    point,
+                    LogicalPoint {
+                        x: monitor.position().x as f64 / scale_factor,
+                        y: monitor.position().y as f64 / scale_factor,
+                    },
+                    GeometryPhysicalSize {
+                        width: monitor.size().width,
+                        height: monitor.size().height,
+                    },
+                    scale_factor,
+                )
+            })
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        window.monitor_from_point(point.x, point.y).ok().flatten()
+    }
 }
 
 fn monitor_geometry(
@@ -4481,7 +5200,12 @@ fn focus_return_pid_for_close(
     selection_revision: u64,
     target: Option<PopupFocusReturnTarget>,
 ) -> Option<i32> {
-    if !popup_was_focused || reason == PopupCloseReason::OutsideClick {
+    if !popup_was_focused
+        || matches!(
+            reason,
+            PopupCloseReason::OutsideClick | PopupCloseReason::ConfigurationChanged
+        )
+    {
         return None;
     }
     target
@@ -4503,8 +5227,7 @@ fn is_point_inside_popup(app: &AppHandle, point: Point) -> bool {
         x: point.x,
         y: point.y,
     };
-    let Some(point_monitor_handle) = window.monitor_from_point(point.x, point.y).ok().flatten()
-    else {
+    let Some(point_monitor_handle) = monitor_for_logical_point(&window, logical_point) else {
         return false;
     };
     let Some(point_monitor) = monitor_geometry(&point_monitor_handle, logical_point) else {
@@ -4543,12 +5266,31 @@ fn commit_popup_close(
     inner: &mut InnerState,
     reason: PopupCloseReason,
 ) -> Result<PopupState, PopupControlError> {
+    let dismissed_automatic_selection = matches!(
+        reason,
+        PopupCloseReason::ExplicitClose | PopupCloseReason::OutsideClick
+    )
+    .then(|| inner.active_popup_selection.clone())
+    .flatten()
+    .filter(|selection| {
+        selection.selection_revision == inner.popup_controller.snapshot().selection_revision
+    })
+    .map(|selection| selection.identity);
     let snapshot = inner.popup_controller.close()?;
     inner.popup_dragging = false;
     match reason {
-        PopupCloseReason::SelectionHandled
-        | PopupCloseReason::ExplicitClose
-        | PopupCloseReason::OutsideClick => clear_active_selection(inner),
+        PopupCloseReason::ExplicitClose | PopupCloseReason::OutsideClick => {
+            if let Some(identity) = dismissed_automatic_selection {
+                inner.dismissed_automatic_selection = Some(identity);
+            }
+            inner.active_popup_selection = None;
+            clear_active_selection(inner);
+        }
+        PopupCloseReason::SelectionHandled | PopupCloseReason::ConfigurationChanged => {
+            inner.active_popup_selection = None;
+            inner.dismissed_automatic_selection = None;
+            clear_active_selection(inner);
+        }
     }
     Ok(snapshot)
 }
@@ -5039,6 +5781,13 @@ fn parse_selection_read_diagnostics(status: &str) -> Option<SelectionReadDiagnos
 fn initial_double_copy_status() -> WatcherStatus {
     if cfg!(target_os = "macos") {
         WatcherStatus::new(true, false, "Cmd+C+C 双复制监听未启用。")
+    } else if cfg!(target_os = "windows") {
+        WatcherStatus::with_code(
+            false,
+            false,
+            "正在初始化 Windows Ctrl+C+C 双复制取词。",
+            "windows_double_copy_pending",
+        )
     } else {
         WatcherStatus::with_code(
             false,
@@ -5052,6 +5801,8 @@ fn initial_double_copy_status() -> WatcherStatus {
 fn initial_selection_status() -> WatcherStatus {
     if cfg!(target_os = "macos") {
         WatcherStatus::new(true, false, "自动选区浮窗监听未启用。")
+    } else if cfg!(target_os = "windows") {
+        WatcherStatus::new(true, false, "正在初始化 Windows 快捷键取词。")
     } else {
         WatcherStatus::with_code(
             false,
@@ -5063,7 +5814,7 @@ fn initial_selection_status() -> WatcherStatus {
 }
 
 fn initial_capability_snapshot() -> CapabilitySnapshot {
-    if cfg!(target_os = "macos") {
+    if cfg!(any(target_os = "macos", target_os = "windows")) {
         CapabilitySnapshot::unknown()
     } else {
         CapabilitySnapshot::unsupported()
@@ -5083,7 +5834,12 @@ fn current_permission_grants() -> (PermissionGrant, PermissionGrant) {
         )
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        (PermissionGrant::Granted, PermissionGrant::Granted)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         (PermissionGrant::Unsupported, PermissionGrant::Unsupported)
     }
@@ -5430,6 +6186,10 @@ fn settings_from_value(value: &serde_json::Value) -> AppSettings {
             .get("enableSelectionPopup")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(defaults.enable_selection_popup),
+        enable_automatic_selection: value
+            .get("enableAutomaticSelection")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(defaults.enable_automatic_selection),
         target_language: value
             .get("targetLanguage")
             .and_then(serde_json::Value::as_str)
@@ -5482,7 +6242,13 @@ fn read_cache(data_dir: &Path) -> CacheFile {
     let Ok(_guard) = CACHE_IO_LOCK.lock() else {
         return CacheFile::default();
     };
-    read_cache_unlocked(data_dir)
+    let mut cache = read_cache_unlocked(data_dir);
+    if prune_expired_cache_entries(&mut cache, cache_epoch_seconds_now()) > 0 {
+        if let Err(error) = save_managed_json(data_dir, &cache_path(data_dir), &cache) {
+            eprintln!("{error}");
+        }
+    }
+    cache
 }
 
 fn read_cache_unlocked(data_dir: &Path) -> CacheFile {
@@ -5501,6 +6267,7 @@ fn insert_cache_entry(data_dir: &Path, key: String, entry: CacheEntry) -> Result
     #[cfg(feature = "acceptance-testing")]
     validate_acceptance_managed_path(data_dir, &cache_path(data_dir))?;
     let mut cache = read_cache_unlocked(data_dir);
+    prune_expired_cache_entries(&mut cache, cache_epoch_seconds_now());
     cache.entries.insert(key, entry);
     trim_cache_entries(&mut cache);
     save_managed_json(data_dir, &cache_path(data_dir), &cache)
@@ -5527,6 +6294,25 @@ fn trim_cache_entries(cache: &mut CacheFile) {
         };
         cache.entries.remove(&oldest_key);
     }
+}
+
+fn prune_expired_cache_entries(cache: &mut CacheFile, now_epoch_seconds: u64) -> usize {
+    let before = cache.entries.len();
+    let latest_allowed = now_epoch_seconds.saturating_add(CACHE_FUTURE_SKEW_SECS);
+    cache.entries.retain(|_, entry| {
+        let Some(created_at) = parse_cache_timestamp(&entry.created_at) else {
+            return false;
+        };
+        created_at <= latest_allowed
+            && now_epoch_seconds.saturating_sub(created_at) <= CACHE_MAX_AGE_SECS
+    });
+    before.saturating_sub(cache.entries.len())
+}
+
+fn parse_cache_timestamp(value: &str) -> Option<u64> {
+    (value.len() == 20 && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| value.parse::<u64>().ok())
+        .flatten()
 }
 
 fn load_glossary(data_dir: &Path) -> Glossary {
@@ -5594,21 +6380,27 @@ fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(to_string)?;
     }
     let content = serde_json::to_string_pretty(value).map_err(to_string)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| "持久化路径缺少父目录。".to_string())?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("paper-float-data");
-    let sequence = ATOMIC_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temporary_path = parent.join(format!(
-        ".{file_name}.tmp-{}-{sequence}",
-        std::process::id()
-    ));
-    write_atomic_file(path, &temporary_path, content.as_bytes())
+    write_atomic_contents(path, content.as_bytes())
 }
 
+fn write_atomic_contents(path: &Path, content: &[u8]) -> Result<(), String> {
+    let _write_guard = ATOMIC_FILE_WRITE_LOCK.lock().map_err(lock_error)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "持久化路径缺少父目录。".to_owned())?;
+    fs::create_dir_all(parent).map_err(to_string)?;
+
+    // Keep the existing fail-closed link policy. AtomicWriteFile also replaces
+    // a destination symlink instead of following it, so a final-component race
+    // cannot redirect these bytes into the symlink target.
+    validate_atomic_write_destination(path)?;
+    let mut file = AtomicWriteFile::open(path).map_err(to_string)?;
+    file.write_all(content).map_err(to_string)?;
+    validate_atomic_write_destination(path)?;
+    file.commit().map_err(to_string)
+}
+
+#[cfg(test)]
 fn write_atomic_file(path: &Path, temporary_path: &Path, content: &[u8]) -> Result<(), String> {
     let _write_guard = ATOMIC_FILE_WRITE_LOCK.lock().map_err(lock_error)?;
     let parent = path
@@ -5881,9 +6673,31 @@ fn compiled_api_key_storage() -> ApiKeyStorage {
         ApiKeyStorage::LocalFile
     }
 
-    #[cfg(not(feature = "local-api-key-file"))]
+    #[cfg(all(not(feature = "local-api-key-file"), target_os = "windows"))]
+    {
+        ApiKeyStorage::WindowsCredentialManager
+    }
+
+    #[cfg(all(not(feature = "local-api-key-file"), not(target_os = "windows")))]
     {
         ApiKeyStorage::SystemKeychain
+    }
+}
+
+fn compiled_runtime_platform() -> RuntimePlatform {
+    #[cfg(target_os = "macos")]
+    {
+        RuntimePlatform::Macos
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        RuntimePlatform::Windows
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        RuntimePlatform::Other
     }
 }
 
@@ -5899,7 +6713,16 @@ fn get_api_key(data_dir: &Path) -> Result<Option<String>, String> {
         macos_native::get_keychain_secret(KEYCHAIN_SERVICE, DEEPSEEK_ACCOUNT)
     }
 
-    #[cfg(all(not(feature = "local-api-key-file"), not(target_os = "macos")))]
+    #[cfg(all(not(feature = "local-api-key-file"), target_os = "windows"))]
+    {
+        let _ = data_dir;
+        platform::get_windows_secret(KEYCHAIN_SERVICE, DEEPSEEK_ACCOUNT)
+    }
+
+    #[cfg(all(
+        not(feature = "local-api-key-file"),
+        not(any(target_os = "macos", target_os = "windows"))
+    ))]
     {
         let _ = data_dir;
         Ok(None)
@@ -5946,7 +6769,19 @@ fn get_api_key_status_for_settings(data_dir: &Path) -> (ApiKeyStatus, Option<Str
         ))
     }
 
-    #[cfg(all(not(feature = "local-api-key-file"), not(target_os = "macos")))]
+    #[cfg(all(not(feature = "local-api-key-file"), target_os = "windows"))]
+    {
+        let _ = data_dir;
+        summarize_api_key_presence_for_settings(platform::windows_secret_exists(
+            KEYCHAIN_SERVICE,
+            DEEPSEEK_ACCOUNT,
+        ))
+    }
+
+    #[cfg(all(
+        not(feature = "local-api-key-file"),
+        not(any(target_os = "macos", target_os = "windows"))
+    ))]
     {
         let _ = data_dir;
         summarize_api_key_presence_for_settings(Ok(false))
@@ -5965,10 +6800,19 @@ fn set_api_key(data_dir: &Path, value: &str) -> Result<(), String> {
         macos_native::set_keychain_secret(KEYCHAIN_SERVICE, DEEPSEEK_ACCOUNT, value)
     }
 
-    #[cfg(all(not(feature = "local-api-key-file"), not(target_os = "macos")))]
+    #[cfg(all(not(feature = "local-api-key-file"), target_os = "windows"))]
+    {
+        let _ = data_dir;
+        platform::set_windows_secret(KEYCHAIN_SERVICE, DEEPSEEK_ACCOUNT, value)
+    }
+
+    #[cfg(all(
+        not(feature = "local-api-key-file"),
+        not(any(target_os = "macos", target_os = "windows"))
+    ))]
     {
         let _ = (data_dir, value);
-        Err("API Key 钥匙串目前仅支持 macOS。".to_string())
+        Err("当前操作系统没有可用的系统安全凭据后端。".to_owned())
     }
 }
 
@@ -5984,10 +6828,151 @@ fn delete_api_key(data_dir: &Path) -> Result<(), String> {
         macos_native::delete_keychain_secret(KEYCHAIN_SERVICE, DEEPSEEK_ACCOUNT)
     }
 
-    #[cfg(all(not(feature = "local-api-key-file"), not(target_os = "macos")))]
+    #[cfg(all(not(feature = "local-api-key-file"), target_os = "windows"))]
+    {
+        let _ = data_dir;
+        platform::delete_windows_secret(KEYCHAIN_SERVICE, DEEPSEEK_ACCOUNT)
+    }
+
+    #[cfg(all(
+        not(feature = "local-api-key-file"),
+        not(any(target_os = "macos", target_os = "windows"))
+    ))]
     {
         let _ = data_dir;
         Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_double_copy_status(enabled: bool, input_running: bool) -> WatcherStatus {
+    if !enabled {
+        WatcherStatus::with_code(
+            true,
+            false,
+            "Ctrl+C+C 双复制取词已在设置中关闭。",
+            "selection_disabled",
+        )
+    } else if input_running {
+        WatcherStatus::with_code(
+            true,
+            true,
+            "Ctrl+C+C 双复制取词已就绪；只确认用户主动执行的复制。",
+            "windows_double_copy_ready",
+        )
+    } else {
+        WatcherStatus::with_code(
+            false,
+            false,
+            "Windows 后台输入监听未能启动；仍可使用 Ctrl+Alt+T 取词。",
+            "windows_raw_input_unavailable",
+        )
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_shortcut_capability_snapshot(
+    selection_enabled: bool,
+    shortcut_registered: bool,
+    input_running: bool,
+    automatic_selection_enabled: bool,
+    automatic_running: bool,
+) -> CapabilitySnapshot {
+    let no_permission_required = PermissionCapabilityState {
+        grant: PermissionGrant::Granted,
+        health: CapabilityHealth::Ready,
+        status_code: Some("windows_uia_no_consent_required".to_owned()),
+    };
+    let listen_event = PermissionCapabilityState {
+        grant: PermissionGrant::Granted,
+        health: CapabilityHealth::Ready,
+        status_code: Some("windows_raw_input_no_consent_required".to_owned()),
+    };
+    let shortcut_health = if !selection_enabled {
+        CapabilityHealth::Disabled
+    } else if shortcut_registered {
+        CapabilityHealth::Ready
+    } else {
+        CapabilityHealth::Unavailable
+    };
+    let shortcut_code = if !selection_enabled {
+        "selection_disabled"
+    } else if shortcut_registered {
+        "windows_global_shortcut_ready"
+    } else {
+        "windows_shortcut_registration_failed"
+    };
+    let input_health = if !selection_enabled {
+        CapabilityHealth::Disabled
+    } else if input_running {
+        CapabilityHealth::Ready
+    } else {
+        CapabilityHealth::Unavailable
+    };
+    let input_code = if !selection_enabled {
+        "selection_disabled"
+    } else if input_running {
+        "windows_raw_input_ready"
+    } else {
+        "windows_raw_input_unavailable"
+    };
+    let mouse_tap = if !selection_enabled {
+        RuntimeCapabilityState::with_status(CapabilityHealth::Disabled, "selection_disabled")
+    } else if !automatic_selection_enabled {
+        RuntimeCapabilityState::with_status(
+            CapabilityHealth::Disabled,
+            "windows_auto_selection_disabled_by_setting",
+        )
+    } else if input_running {
+        RuntimeCapabilityState::with_status(CapabilityHealth::Ready, "windows_raw_mouse_ready")
+    } else {
+        RuntimeCapabilityState::with_status(
+            CapabilityHealth::Degraded,
+            "windows_raw_mouse_unavailable",
+        )
+    };
+    let selection_observer = if !selection_enabled {
+        RuntimeCapabilityState::with_status(CapabilityHealth::Disabled, "selection_disabled")
+    } else if !automatic_selection_enabled {
+        RuntimeCapabilityState::with_status(
+            CapabilityHealth::Disabled,
+            "windows_auto_selection_disabled_by_setting",
+        )
+    } else if automatic_running {
+        RuntimeCapabilityState::with_status(CapabilityHealth::Ready, "windows_uia_observer_ready")
+    } else {
+        RuntimeCapabilityState::with_status(
+            CapabilityHealth::Degraded,
+            "windows_uia_observer_unavailable",
+        )
+    };
+
+    CapabilitySnapshot {
+        accessibility: no_permission_required,
+        listen_event,
+        mouse_tap,
+        key_tap: RuntimeCapabilityState::with_status(input_health, input_code),
+        ax_selected_text_observer: selection_observer,
+        direct_selection_read: RuntimeCapabilityState::with_status(
+            if shortcut_registered && selection_enabled {
+                CapabilityHealth::Unknown
+            } else {
+                shortcut_health
+            },
+            if shortcut_registered && selection_enabled {
+                "windows_uia_not_probed"
+            } else {
+                shortcut_code
+            },
+        ),
+        clipboard_double_copy_fallback: RuntimeCapabilityState::with_status(
+            input_health,
+            if input_running && selection_enabled {
+                "windows_double_copy_ready"
+            } else {
+                input_code
+            },
+        ),
     }
 }
 
@@ -6511,8 +7496,15 @@ fn build_empty_clipboard_message() -> String {
     "剪贴板中没有可翻译文本。".to_string()
 }
 
-fn iso_now() -> String {
-    format!("{:?}", std::time::SystemTime::now())
+fn cache_epoch_seconds_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn cache_timestamp_now() -> String {
+    format!("{:020}", cache_epoch_seconds_now())
 }
 
 fn to_string(error: impl std::fmt::Display) -> String {
@@ -6545,6 +7537,138 @@ mod tests {
         fn drop(&mut self) {
             self.drop_count.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn startup_gate_times_out_then_remains_ready() {
+        let gate = StartupGate::default();
+        assert!(gate.wait(Duration::from_millis(1)).is_err());
+        gate.mark_ready().expect("startup gate should become ready");
+        gate.mark_ready()
+            .expect("marking ready should be idempotent");
+        gate.wait(Duration::ZERO)
+            .expect("a ready gate should never wait or time out");
+    }
+
+    #[test]
+    fn startup_gate_wakes_a_waiting_settings_request() {
+        let gate = Arc::new(StartupGate::default());
+        let waiting_gate = gate.clone();
+        let waiter = std::thread::spawn(move || waiting_gate.wait(Duration::from_secs(1)));
+        gate.mark_ready().expect("startup gate should become ready");
+        waiter
+            .join()
+            .expect("settings waiter should not panic")
+            .expect("settings waiter should be released");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_cursor_conversion_respects_negative_origins_scale_and_half_open_bounds() {
+        let point = windows_physical_to_monitor_logical(
+            -960.0,
+            540.0,
+            PhysicalPoint { x: -1920, y: 0 },
+            GeometryPhysicalSize {
+                width: 1920,
+                height: 1080,
+            },
+            1.25,
+        )
+        .expect("point should be inside the negative-origin monitor");
+
+        assert!((point.x + 768.0).abs() < f64::EPSILON);
+        assert!((point.y - 432.0).abs() < f64::EPSILON);
+        assert!(windows_physical_to_monitor_logical(
+            0.0,
+            540.0,
+            PhysicalPoint { x: -1920, y: 0 },
+            GeometryPhysicalSize {
+                width: 1920,
+                height: 1080,
+            },
+            1.25,
+        )
+        .is_none());
+        assert!(windows_physical_to_monitor_logical(
+            -960.0,
+            1080.0,
+            PhysicalPoint { x: -1920, y: 0 },
+            GeometryPhysicalSize {
+                width: 1920,
+                height: 1080,
+            },
+            1.25,
+        )
+        .is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_shortcut_capabilities_distinguish_ready_disabled_and_conflict() {
+        let ready = windows_shortcut_capability_snapshot(true, true, true, false, false);
+        assert_eq!(ready.key_tap.health, CapabilityHealth::Ready);
+        assert_eq!(
+            ready.key_tap.status_code.as_deref(),
+            Some("windows_raw_input_ready")
+        );
+        assert_eq!(
+            ready.direct_selection_read.health,
+            CapabilityHealth::Unknown
+        );
+        assert_eq!(
+            ready.clipboard_double_copy_fallback.health,
+            CapabilityHealth::Ready
+        );
+        assert_eq!(ready.mouse_tap.health, CapabilityHealth::Disabled);
+        assert_eq!(
+            ready.mouse_tap.status_code.as_deref(),
+            Some("windows_auto_selection_disabled_by_setting")
+        );
+
+        let automatic = windows_shortcut_capability_snapshot(true, true, true, true, true);
+        assert_eq!(automatic.mouse_tap.health, CapabilityHealth::Ready);
+        assert_eq!(
+            automatic.ax_selected_text_observer.health,
+            CapabilityHealth::Ready
+        );
+
+        let disabled = windows_shortcut_capability_snapshot(false, true, true, true, true);
+        assert_eq!(disabled.key_tap.health, CapabilityHealth::Disabled);
+        assert_eq!(
+            disabled.key_tap.status_code.as_deref(),
+            Some("selection_disabled")
+        );
+
+        let conflict = windows_shortcut_capability_snapshot(true, false, true, false, false);
+        assert_eq!(conflict.key_tap.health, CapabilityHealth::Ready);
+        assert_eq!(
+            conflict.direct_selection_read.health,
+            CapabilityHealth::Unavailable
+        );
+        assert_eq!(
+            conflict.direct_selection_read.status_code.as_deref(),
+            Some("windows_shortcut_registration_failed")
+        );
+
+        let input_unavailable = windows_shortcut_capability_snapshot(true, true, false, true, true);
+        assert_eq!(
+            input_unavailable.key_tap.health,
+            CapabilityHealth::Unavailable
+        );
+        assert_eq!(
+            input_unavailable.clipboard_double_copy_fallback.health,
+            CapabilityHealth::Unavailable
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_permission_model_does_not_claim_a_global_input_consent() {
+        assert_eq!(
+            current_permission_grants(),
+            (PermissionGrant::Granted, PermissionGrant::Granted)
+        );
     }
 
     #[test]
@@ -6602,6 +7726,45 @@ mod tests {
     }
 
     #[test]
+    fn cache_pruning_enforces_ttl_and_rejects_legacy_or_implausible_timestamps() {
+        let now = 2_000_000_000_u64;
+        let mut cache = CacheFile::default();
+        for (key, created_at) in [
+            ("fresh", now),
+            ("boundary", now - CACHE_MAX_AGE_SECS),
+            ("expired", now - CACHE_MAX_AGE_SECS - 1),
+            ("future-skew", now + CACHE_FUTURE_SKEW_SECS),
+            ("future-invalid", now + CACHE_FUTURE_SKEW_SECS + 1),
+        ] {
+            cache.entries.insert(
+                key.to_owned(),
+                test_cache_entry(key.to_owned(), format!("{created_at:020}")),
+            );
+        }
+        cache.entries.insert(
+            "legacy".to_owned(),
+            test_cache_entry(
+                "legacy".to_owned(),
+                "SystemTime { tv_sec: 1, tv_nsec: 0 }".to_owned(),
+            ),
+        );
+
+        assert_eq!(prune_expired_cache_entries(&mut cache, now), 3);
+        assert_eq!(
+            cache
+                .entries
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([
+                "boundary".to_owned(),
+                "fresh".to_owned(),
+                "future-skew".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
     fn concurrent_cache_updates_preserve_every_entry() {
         let directory = unique_test_directory("cache-rmw");
         fs::create_dir_all(&directory).expect("test cache directory should be created");
@@ -6613,7 +7776,7 @@ mod tests {
                 insert_cache_entry(
                     &directory,
                     key.clone(),
-                    test_cache_entry(key, format!("{index:08}")),
+                    test_cache_entry(key, cache_timestamp_now()),
                 )
             }));
         }
@@ -6963,7 +8126,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "local-api-key-file")]
+    #[cfg(all(feature = "local-api-key-file", unix))]
     #[test]
     fn local_api_key_round_trip_uses_private_permissions_and_never_needs_keychain() {
         let directory = unique_test_directory("local-api-key-round-trip");
@@ -7416,6 +8579,14 @@ mod tests {
     fn settings_close_hides_during_background_operation_but_not_during_quit() {
         assert!(should_hide_settings_window_on_close(false));
         assert!(!should_hide_settings_window_on_close(true));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn user_exit_request_keeps_windows_background_agent_alive() {
+        assert!(should_keep_background_agent_running(None, false));
+        assert!(!should_keep_background_agent_running(None, true));
+        assert!(!should_keep_background_agent_running(Some(0), false));
     }
 
     #[test]
@@ -8295,27 +9466,41 @@ mod tests {
     }
 
     #[test]
-    fn outside_click_clears_active_selection_without_text_suppression() {
+    fn closing_an_automatic_popup_suppresses_the_same_selection_identity() {
         let mut inner = test_inner_state("selection", Some("same text"));
+        inner.active_popup_selection = Some(ActivePopupSelection {
+            identity: SelectionIdentity::new(9001, "same text"),
+            selection_revision: 1,
+        });
 
         let hidden = commit_popup_close(&mut inner, PopupCloseReason::OutsideClick)
             .expect("outside click should close");
 
         assert_eq!(inner.active_selection_text, None);
+        assert_eq!(
+            inner.dismissed_automatic_selection,
+            Some(SelectionIdentity::new(9001, "same text"))
+        );
         assert_eq!(hidden.status, PopupStatus::Hidden);
         assert!(!hidden.visible);
         assert_eq!(inner.popup_controller.translation_generation(), 1);
     }
 
     #[test]
-    fn same_text_is_accepted_again_for_a_new_native_generation() {
+    fn suppressed_automatic_selection_stays_closed_until_the_identity_changes() {
         let mut inner = test_inner_state("idle", None);
         let anchor = Point { x: 10.0, y: 20.0 };
 
-        let first =
-            prepare_selection_popup_locked(&mut inner, "same text".to_string(), anchor, 41, 9001)
-                .expect("first native generation should be valid")
-                .expect("first native generation should be accepted");
+        let first = prepare_selection_popup_locked(
+            &mut inner,
+            "same text".to_string(),
+            anchor,
+            41,
+            9001,
+            SelectionTriggerKind::Automatic,
+        )
+        .expect("first native generation should be valid")
+        .expect("first native generation should be accepted");
         assert_eq!(
             inner.popup_focus_return_target,
             Some(PopupFocusReturnTarget {
@@ -8323,21 +9508,36 @@ mod tests {
                 pid: 9001,
             })
         );
-        assert_eq!(
-            prepare_selection_popup_locked(&mut inner, "same text".to_string(), anchor, 41, 9001)
-                .expect_err("equal generation should be rejected")
-                .code(),
-            "popup_control.native_generation_not_monotonic"
-        );
-        let second =
-            prepare_selection_popup_locked(&mut inner, "same text".to_string(), anchor, 42, 9001)
-                .expect("new native generation should be valid")
-                .expect("new native generation should be accepted");
+        let hidden = commit_popup_close(&mut inner, PopupCloseReason::ExplicitClose)
+            .expect("explicit close should suppress the automatic selection");
+        assert!(!hidden.visible);
+        assert!(prepare_selection_popup_locked(
+            &mut inner,
+            "same text".to_string(),
+            anchor,
+            42,
+            9001,
+            SelectionTriggerKind::Automatic,
+        )
+        .expect("new automatic generation should be consumed")
+        .is_none());
+        assert!(!inner.popup_controller.snapshot().visible);
+
+        let second = prepare_selection_popup_locked(
+            &mut inner,
+            "different text".to_string(),
+            anchor,
+            43,
+            9001,
+            SelectionTriggerKind::Automatic,
+        )
+        .expect("changed automatic selection should be valid")
+        .expect("changed automatic selection should open");
 
         assert!(second.selection_revision > first.selection_revision);
         assert_eq!(
             inner.popup_controller.snapshot().cleaned_text.as_deref(),
-            Some("same text")
+            Some("different text")
         );
         assert_eq!(
             inner.popup_focus_return_target,
@@ -8346,6 +9546,121 @@ mod tests {
                 pid: 9001,
             })
         );
+    }
+
+    #[test]
+    fn deliberate_selection_overrides_an_automatic_dismissal() {
+        let mut inner = test_inner_state("idle", None);
+        let anchor = Point { x: 10.0, y: 20.0 };
+        inner.dismissed_automatic_selection = Some(SelectionIdentity::new(9001, "same text"));
+
+        let state = prepare_selection_popup_locked(
+            &mut inner,
+            "same text".to_string(),
+            anchor,
+            51,
+            9001,
+            SelectionTriggerKind::Deliberate,
+        )
+        .expect("deliberate selection should be valid")
+        .expect("deliberate selection should override dismissal");
+
+        assert!(state.visible);
+        assert_eq!(inner.dismissed_automatic_selection, None);
+    }
+
+    #[test]
+    fn closing_a_deliberate_popup_still_blocks_automatic_reopen() {
+        let mut inner = test_inner_state("idle", None);
+        let anchor = Point { x: 10.0, y: 20.0 };
+
+        let deliberate = prepare_selection_popup_locked(
+            &mut inner,
+            "same text".to_string(),
+            anchor,
+            56,
+            9001,
+            SelectionTriggerKind::Deliberate,
+        )
+        .expect("deliberate selection should be valid")
+        .expect("deliberate selection should open");
+        assert!(deliberate.visible);
+
+        commit_popup_close(&mut inner, PopupCloseReason::ExplicitClose)
+            .expect("user close should take priority");
+
+        assert!(prepare_selection_popup_locked(
+            &mut inner,
+            "same text".to_string(),
+            anchor,
+            57,
+            9001,
+            SelectionTriggerKind::Automatic,
+        )
+        .expect("automatic generation should be consumed")
+        .is_none());
+        assert!(!inner.popup_controller.snapshot().visible);
+    }
+
+    #[test]
+    fn copying_source_keeps_the_same_automatic_selection_suppressed() {
+        let mut inner = test_inner_state("idle", None);
+        let anchor = Point { x: 10.0, y: 20.0 };
+
+        prepare_selection_popup_locked(
+            &mut inner,
+            "same text".to_string(),
+            anchor,
+            58,
+            9001,
+            SelectionTriggerKind::Automatic,
+        )
+        .expect("automatic selection should be valid")
+        .expect("automatic selection should open");
+        commit_popup_close(&mut inner, PopupCloseReason::ExplicitClose)
+            .expect("copy-source close should take priority");
+
+        assert_eq!(
+            inner.dismissed_automatic_selection,
+            Some(SelectionIdentity::new(9001, "same text"))
+        );
+    }
+
+    #[test]
+    fn empty_automatic_selection_clears_dismissal_without_opening() {
+        let mut inner = test_inner_state("idle", None);
+        let anchor = Point { x: 10.0, y: 20.0 };
+        inner.dismissed_automatic_selection = Some(SelectionIdentity::new(9001, "same text"));
+
+        assert!(prepare_selection_popup_locked(
+            &mut inner,
+            "   ".to_string(),
+            anchor,
+            61,
+            9001,
+            SelectionTriggerKind::Automatic,
+        )
+        .expect("empty selection generation should be accepted")
+        .is_none());
+        assert_eq!(inner.dismissed_automatic_selection, None);
+    }
+
+    #[test]
+    fn self_process_deselection_cannot_clear_user_dismissal() {
+        let translator_pid = std::process::id() as i32;
+
+        assert!(!should_clear_automatic_dismissal_for_focus(
+            translator_pid,
+            translator_pid
+        ));
+        assert!(!should_clear_automatic_dismissal_for_focus(
+            0,
+            translator_pid
+        ));
+        assert!(should_clear_automatic_dismissal_for_focus(
+            translator_pid.saturating_add(1),
+            translator_pid
+        ));
     }
 
     #[test]
@@ -8913,6 +10228,8 @@ mod tests {
             capability_snapshot: CapabilitySnapshot::unknown(),
             last_double_copy_trigger: None,
             active_selection_text: cleaned_text.map(str::to_string),
+            active_popup_selection: None,
+            dismissed_automatic_selection: None,
             last_selection_read: None,
             latched_selection_baseline_error: None,
             popup_positioned: false,

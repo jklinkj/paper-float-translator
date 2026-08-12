@@ -4,7 +4,6 @@ import {
   BookOpenText,
   Check,
   Clipboard,
-  GripHorizontal,
   Languages,
   Loader2,
   Pin,
@@ -319,9 +318,17 @@ export function PopupView(): JSX.Element {
             onPointerDown={startWindowDrag}
           >
             <div className="popup-title">
-              <GripHorizontal className="popup-title-grip" size={16} />
-              <BookOpenText size={17} />
-              <span>AI 翻译助手</span>
+              <span className="popup-brand-mark" aria-hidden="true">
+                <Languages size={15} />
+              </span>
+              <span>Paper Float</span>
+              <span className="popup-state-label">
+                {state.status === "translating"
+                  ? "翻译中"
+                  : state.status === "error"
+                    ? "需要处理"
+                    : "译文"}
+              </span>
               {state.cached ? <span className="badge">缓存</span> : null}
             </div>
             <div className="popup-tools" onPointerDownCapture={stopDragPropagation}>
@@ -333,7 +340,12 @@ export function PopupView(): JSX.Element {
               >
                 {state.pinned ? <PinOff size={16} /> : <Pin size={16} />}
               </button>
-              <button type="button" title="关闭" onClick={closePopup}>
+              <button
+                type="button"
+                title="关闭并静默当前选区"
+                aria-label="关闭"
+                onClick={closePopup}
+              >
                 <X size={16} />
               </button>
             </div>
@@ -409,31 +421,35 @@ export function PopupView(): JSX.Element {
         >
         {isSelectionState && !isSelectionReady ? (
           <>
-            <div className="selection-summary pending-summary" role="status" aria-live="polite">
+            <div
+              className="selection-summary selection-drag-surface pending-summary"
+              role="status"
+              aria-live="polite"
+              title="拖动浮窗"
+              onPointerDown={startWindowDrag}
+            >
               <span className="pending-title">
                 <Loader2 className="spin" size={16} />
                 <strong>{actionError ? "操作失败" : "正在读取所选内容"}</strong>
               </span>
               {actionError || sourcePreview ? <span dir="auto">{actionError ?? sourcePreview}</span> : null}
             </div>
-            <button type="button" onClick={closePopup}>
+            <button type="button" title="关闭并静默当前选区" onClick={closePopup}>
               <X size={15} />
               关闭
             </button>
           </>
         ) : isSelectionReady ? (
           <>
-            <div className="selection-summary" role="status" aria-live="polite">
-              <strong>{actionError ? "操作失败" : "所选内容"}</strong>
-              {actionError || sourcePreview ? <span dir="auto">{actionError ?? sourcePreview}</span> : null}
-            </div>
             <div
-              className="selection-drag-handle"
+              className="selection-summary selection-drag-surface"
+              role="status"
+              aria-live="polite"
               title="拖动浮窗"
-              aria-hidden="true"
               onPointerDown={startWindowDrag}
             >
-              <GripHorizontal size={16} />
+              <strong>{actionError ? "操作失败" : "所选内容"}</strong>
+              {actionError || sourcePreview ? <span dir="auto">{actionError ?? sourcePreview}</span> : null}
             </div>
             <button type="button" onClick={copySource} disabled={!state.cleanedText && !state.sourceText}>
               {copied ? <Check size={15} /> : <Clipboard size={15} />}
@@ -443,7 +459,7 @@ export function PopupView(): JSX.Element {
               <Languages size={15} />
               翻译
             </button>
-            <button type="button" onClick={closePopup}>
+            <button type="button" title="关闭并静默当前选区" onClick={closePopup}>
               <X size={15} />
               关闭
             </button>

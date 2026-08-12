@@ -20,6 +20,18 @@ const VERIFIER_PATH = fileURLToPath(
   new URL("../../scripts/verify-mac-release.sh", import.meta.url)
 );
 
+const WINDOWS_GIT_BASH = join(
+  process.env.ProgramFiles ?? "C:\\Program Files",
+  "Git",
+  "bin",
+  "bash.exe"
+);
+const BASH_EXECUTABLE =
+  process.env.PAPER_FLOAT_TEST_BASH ??
+  (process.platform === "win32" && existsSync(WINDOWS_GIT_BASH)
+    ? WINDOWS_GIT_BASH
+    : "bash");
+
 const DEVELOPER_ID_METADATA = [
   "Executable=/tmp/Paper Float Translator",
   "Identifier=com.paperfloat.translator",
@@ -54,7 +66,7 @@ afterEach(() => {
 });
 
 function runPolicy(command: string, input: string, ...args: string[]) {
-  return spawnSync("bash", [POLICY_PATH, command, ...args], {
+  return spawnSync(BASH_EXECUTABLE, [POLICY_PATH, command, ...args], {
     encoding: "utf8",
     input
   });
@@ -105,7 +117,7 @@ fi
     chmodSync(path, 0o755);
   }
 
-  const result = spawnSync("bash", [VERIFIER_PATH, appPath], {
+  const result = spawnSync(BASH_EXECUTABLE, [VERIFIER_PATH, appPath], {
     encoding: "utf8",
     env: {
       ...process.env,

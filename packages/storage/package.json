@@ -3,6 +3,13 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "license": "Apache-2.0",
+  "author": "Jinke Lin and Paper Float Translator contributors",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jklinkj/paper-float-translator.git",
+    "directory": "packages/storage"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {

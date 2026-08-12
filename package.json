@@ -1,27 +1,52 @@
 {
   "name": "paper-float-translator",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
+  "license": "Apache-2.0",
+  "author": "Jinke Lin and Paper Float Translator contributors",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jklinkj/paper-float-translator.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jklinkj/paper-float-translator/issues"
+  },
+  "homepage": "https://github.com/jklinkj/paper-float-translator#readme",
+  "engines": {
+    "node": ">=24.14.0 <25",
+    "npm": ">=11.9.0 <12"
+  },
   "workspaces": [
     "packages/*",
     "apps/*"
   ],
   "scripts": {
     "dev": "npm run dev -w @paper-float-translator/desktop",
+    "dev:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File apps/desktop/scripts/windows-tauri.ps1 dev",
     "build": "npm run build --workspaces --if-present",
+    "build:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File apps/desktop/scripts/windows-tauri.ps1 build",
     "test": "vitest run",
     "test:ui": "bash apps/desktop/scripts/test-ui.sh",
     "typecheck": "tsc -b",
     "check:format": "cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --all -- --check",
     "check:renderer": "npm run build:renderer -w @paper-float-translator/desktop",
-    "check:ui": "playwright test",
+    "check:ui": "node apps/desktop/scripts/run-playwright.mjs",
     "check:rust": "cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --locked --all-targets",
     "check:rust:test": "cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked",
     "check:rust:clippy": "cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --locked --all-targets -- -D warnings",
     "check:rust:local": "cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --locked --all-targets --features local-api-key-file",
     "check:rust:test:local": "cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked --features local-api-key-file",
     "check:rust:clippy:local": "cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --locked --all-targets --features local-api-key-file -- -D warnings",
+    "check:licenses:npm": "node scripts/check-npm-licenses.mjs",
+    "check:licenses:rust": "cargo deny --manifest-path apps/desktop/src-tauri/Cargo.toml --all-features check licenses sources",
+    "check:advisories:npm": "npm audit --audit-level=high",
+    "check:advisories:rust": "cargo deny --manifest-path apps/desktop/src-tauri/Cargo.toml --all-features check advisories",
+    "check:advisories": "npm run check:advisories:npm && npm run check:advisories:rust",
+    "check:licenses": "npm run check:licenses:npm && npm run check:licenses:rust",
+    "generate:licenses:npm": "npm run build:renderer -w @paper-float-translator/desktop",
+    "generate:licenses:rust": "cargo about generate --manifest-path apps/desktop/src-tauri/Cargo.toml --all-features --locked --offline --fail --output-file THIRD_PARTY_LICENSES_RUST.html apps/desktop/src-tauri/about.hbs",
+    "generate:licenses": "npm run generate:licenses:npm && npm run generate:licenses:rust",
     "quality": "npm run check:format && npm run typecheck && npm test && npm run check:renderer && npm run check:ui && npm run check:rust && npm run check:rust:test && npm run check:rust:clippy && npm run check:rust:local && npm run check:rust:test:local && npm run check:rust:clippy:local",
     "check": "npm run quality"
   },

@@ -1,0 +1,45 @@
+[graph]
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+]
+
+[advisories]
+# Known vulnerabilities and unsoundness always fail. For maintenance-only
+# advisories, fail when this workspace chose the crate directly; framework
+# transitive dependencies remain visible until their upstream replaces them.
+unmaintained = "workspace"
+yanked = "deny"
+maximum-db-staleness = "P7D"
+unused-ignored-advisory = "deny"
+
+[licenses]
+confidence-threshold = 0.93
+include-dev = true
+include-build = true
+unused-allowed-license = "warn"
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+
+[licenses.private]
+ignore = false
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

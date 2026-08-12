@@ -1,0 +1,195 @@
+name: Unsigned Windows release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to build, without a leading v
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+concurrency:
+  group: windows-release-candidate
+  cancel-in-progress: false
+
+jobs:
+  compliance:
+    name: Check open-source policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out the selected source revision
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      - name: Install locked JavaScript dependencies
+        run: npm ci
+
+      - name: Check npm dependency licenses
+        run: npm run check:licenses:npm
+
+      - name: Check npm security advisories
+        run: npm run check:advisories:npm
+
+      - name: Set up pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+
+      - name: Install pinned cargo-about
+        uses: taiki-e/install-action@v2.85.11
+        with:
+          tool: cargo-about@0.9.1
+          fallback: none
+
+      - name: Fetch locked Rust dependencies for offline attribution
+        run: cargo fetch --manifest-path apps/desktop/src-tauri/Cargo.toml --locked
+
+      - name: Verify generated third-party attributions are current
+        run: |
+          npm run generate:licenses
+          git diff --exit-code -- THIRD_PARTY_LICENSES_NPM.txt THIRD_PARTY_LICENSES_RUST.html
+
+      # cargo-deny-action is a Docker action, so keep it on a Linux runner.
+      - name: Check Cargo advisories, licenses, and sources
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          rust-version: "1.97.1"
+          manifest-path: apps/desktop/src-tauri/Cargo.toml
+          arguments: --all-features
+          command: check advisories licenses sources
+
+  build:
+    name: Build unsigned Windows candidate
+    needs: compliance
+    runs-on: windows-latest
+    timeout-minutes: 60
+    environment: unsigned-release-candidate
+
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_TARGET_DIR: ${{ github.workspace }}\target\cargo-windows
+      PLAYWRIGHT_BROWSER_CHANNEL: chrome
+
+    steps:
+      - name: Check out the selected source revision
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      - name: Set up pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+
+      - name: Make Git Bash visible to contract tests
+        shell: pwsh
+        run: '"C:\Program Files\Git\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append'
+
+      - name: Verify release identity
+        shell: pwsh
+        run: |
+          $requested = '${{ inputs.version }}'
+          $npmVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $tauriVersion = (Get-Content apps/desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $cargoVersion = (Select-String -Path apps/desktop/src-tauri/Cargo.toml -Pattern '^version = "([^"]+)"$' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($requested -notmatch '^\d+\.\d+\.\d+([-.][0-9A-Za-z.-]+)?$') { throw "Invalid requested version: $requested" }
+          if ($requested -ne $npmVersion -or $requested -ne $tauriVersion -or $requested -ne $cargoVersion) {
+            throw "Version mismatch: requested=$requested npm=$npmVersion tauri=$tauriVersion cargo=$cargoVersion"
+          }
+          "SOURCE_REVISION=${{ github.sha }}" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install locked JavaScript dependencies
+        run: npm ci
+
+      - name: Run JavaScript and contract tests
+        run: npm test
+
+      - name: Type-check workspaces
+        run: npm run typecheck
+
+      - name: Build renderer and run UI tests
+        run: |
+          npm run check:renderer
+          npm run check:ui
+
+      - name: Run Rust tests
+        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked
+
+      - name: Build unsigned NSIS candidate
+        run: npm run build:windows
+
+      - name: Assemble release evidence
+        shell: pwsh
+        run: |
+          $releaseDir = Join-Path $env:GITHUB_WORKSPACE 'release-candidate'
+          New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+          $installers = @(Get-ChildItem (Join-Path $env:CARGO_TARGET_DIR 'release\bundle\nsis') -Filter '*-setup.exe' -File)
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one NSIS installer, found $($installers.Count)"
+          }
+          $installer = $installers[0]
+          Copy-Item -LiteralPath $installer.FullName -Destination $releaseDir
+          Copy-Item -LiteralPath 'LICENSE' -Destination $releaseDir
+          Copy-Item -LiteralPath 'NOTICE' -Destination $releaseDir
+          Copy-Item -LiteralPath 'THIRD_PARTY_NOTICES.md' -Destination $releaseDir
+          Copy-Item -LiteralPath 'THIRD_PARTY_LICENSES_NPM.txt' -Destination $releaseDir
+          Copy-Item -LiteralPath 'THIRD_PARTY_LICENSES_RUST.html' -Destination $releaseDir
+          @(
+            "Paper Float Translator ${{ inputs.version }}",
+            "Source repository: ${{ github.server_url }}/${{ github.repository }}",
+            "Source revision: $env:SOURCE_REVISION",
+            "Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "Signature status: unsigned release candidate; not for public trusted distribution"
+          ) | Set-Content -Encoding utf8 (Join-Path $releaseDir 'BUILD-INFO.txt')
+          Get-ChildItem $releaseDir -File | Sort-Object Name | Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLowerInvariant())  $([IO.Path]::GetFileName($_.Path))" } |
+            Set-Content -Encoding ascii (Join-Path $releaseDir 'SHA256SUMS.txt')
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: release-candidate/paper-float-translator-${{ inputs.version }}.spdx.json
+          artifact-name: paper-float-translator-${{ inputs.version }}-sbom.spdx.json
+          upload-release-assets: false
+
+      - name: Refresh checksums after SBOM generation
+        shell: pwsh
+        run: |
+          Get-ChildItem release-candidate -File | Where-Object Name -ne 'SHA256SUMS.txt' | Sort-Object Name | Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLowerInvariant())  $([IO.Path]::GetFileName($_.Path))" } |
+            Set-Content -Encoding ascii release-candidate/SHA256SUMS.txt
+
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: release-candidate/*-setup.exe
+
+      - name: Upload unsigned candidate bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: paper-float-translator-${{ inputs.version }}-windows-unsigned
+          path: release-candidate/
+          if-no-files-found: error
+          retention-days: 30

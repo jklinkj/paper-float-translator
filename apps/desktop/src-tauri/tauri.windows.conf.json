@@ -1,0 +1,23 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": ["nsis"],
+    "useLocalToolsDir": true,
+    "shortDescription": "A lightweight Windows translator for paper reading.",
+    "longDescription": "Paper Float Translator for Windows shows translation actions near selected text and provides a keyboard-driven fallback when an application does not expose its selection through UI Automation.",
+    "icon": ["icons/icon.ico"],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
+      "allowDowngrades": false,
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["SimpChinese", "English"],
+        "displayLanguageSelector": false,
+        "installerHooks": "windows/privacy-notice.nsh"
+      }
+    }
+  }
+}

@@ -14,3 +14,8 @@ output/playwright/
 playwright-report/
 test-results/
 tmp/
+/.tooling/
+/.cache/
+/target/
+/apps/desktop/src-tauri/target/
+/release-candidate/

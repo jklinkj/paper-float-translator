@@ -39,6 +39,9 @@ const RUN_CONTEXT_MARKER = "let context = tauri::generate_context!();";
 const BUILDER_MARKER = "tauri::Builder::default()";
 const SETUP_MARKER = ".setup(move |app| {";
 
+const readUtf8WithLf = (path: string): string =>
+  readFileSync(path, "utf8").replace(/\r\n/g, "\n");
+
 const RUN_PRE_BUILDER_IDENTITY_GUARD =
   /^let context = tauri::generate_context!\(\);\s*if let Err\(error\) = validate_compiled_runtime_identity\(\s*&context\.config\(\)\.identifier,\s*&context\.package_info\(\)\.name,\s*\) \{\s*eprintln!\("\{error\}"\);\s*return;\s*\}/s;
 
@@ -147,7 +150,7 @@ describe("acceptance artifact isolation contract", () => {
   });
 
   it("guards both compiled artifact identities before Builder and again in setup", () => {
-    const source = readFileSync(LIB_PATH, "utf8");
+    const source = readUtf8WithLf(LIB_PATH);
     const validatorStart = source.indexOf("fn validate_compiled_runtime_identity(");
     const validatorDeclarationPrefix = source.slice(
       Math.max(0, validatorStart - 160),
@@ -157,10 +160,17 @@ describe("acceptance artifact isolation contract", () => {
     const setupEnd = source.indexOf("Ok(())", setupStart);
     const setup = source.slice(setupStart, setupEnd);
 
-    const dataResolution = setup.indexOf("app.path().app_data_dir()");
-    const dataPreparation = setup.indexOf("prepare_acceptance_data_dir");
-    const dataCreation = setup.indexOf("ensure_data_dir(&data_dir)");
-    const watcherStart = setup.indexOf("restart_macos_watchers");
+    const builderStart = source.indexOf(BUILDER_MARKER, source.indexOf(RUN_CONTEXT_MARKER));
+    const preBuilder = source.slice(source.indexOf(RUN_CONTEXT_MARKER), builderStart);
+
+    const acceptanceDataResolution = preBuilder.indexOf(
+      "let data_dir = match expected_acceptance_data_dir()"
+    );
+    const dataPreparation = preBuilder.indexOf("prepare_acceptance_data_dir(&data_dir)");
+    const productionDataResolution = preBuilder.indexOf("let data_dir = dirs::data_dir()");
+    const dataCreation = preBuilder.indexOf("ensure_data_dir(&data_dir)");
+    const runtimeDataResolution = setup.indexOf("app.path().app_data_dir()");
+    const watcherStart = setup.indexOf("restart_platform_watchers");
 
     expect(source).toMatch(
       /#\[cfg\(not\(feature = "acceptance-testing"\)\)\]\nconst EXPECTED_PRODUCT_NAME: &str = "Paper Float Translator";/
@@ -182,9 +192,13 @@ describe("acceptance artifact isolation contract", () => {
 
     expect(hasUnconditionalPreBuilderIdentityGuard(source)).toBe(true);
     expect(hasUnconditionalSetupIdentityGuard(source)).toBe(true);
-    expect(dataResolution).toBeLessThan(dataPreparation);
-    expect(dataPreparation).toBeLessThan(dataCreation);
-    expect(dataCreation).toBeLessThan(watcherStart);
+    expect(acceptanceDataResolution).toBeGreaterThanOrEqual(0);
+    expect(acceptanceDataResolution).toBeLessThan(dataPreparation);
+    expect(dataPreparation).toBeLessThan(productionDataResolution);
+    expect(productionDataResolution).toBeLessThan(dataCreation);
+    expect(dataCreation).toBeLessThan(preBuilder.length);
+    expect(runtimeDataResolution).toBeGreaterThanOrEqual(0);
+    expect(runtimeDataResolution).toBeLessThan(watcherStart);
 
     const reverseMismatchMutation = source.replace(
       "    if let Err(error) = validate_compiled_runtime_identity(\n        &context.config().identifier,",
@@ -195,7 +209,7 @@ describe("acceptance artifact isolation contract", () => {
   });
 
   it("keeps acceptance Keychain namespaces behind compile-time feature gates", () => {
-    const source = readFileSync(LIB_PATH, "utf8");
+    const source = readUtf8WithLf(LIB_PATH);
 
     expect(source).toMatch(
       /#\[cfg\(all\(\s*not\(feature = "acceptance-testing"\),\s*not\(feature = "local-api-key-file"\)\s*\)\)\]\s*const KEYCHAIN_SERVICE: &str = "Paper Float Translator API Key v2";/

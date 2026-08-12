@@ -1,6 +1,8 @@
 import { defineConfig, devices } from "@playwright/test";
 
-const browserChannel = process.env.PLAYWRIGHT_BROWSER_CHANNEL ?? (process.platform === "darwin" ? "chrome" : undefined);
+const browserChannel =
+  process.env.PLAYWRIGHT_BROWSER_CHANNEL ??
+  (process.platform === "darwin" || process.platform === "win32" ? "chrome" : undefined);
 
 export default defineConfig({
   testDir: "./apps/desktop/tests/ui",

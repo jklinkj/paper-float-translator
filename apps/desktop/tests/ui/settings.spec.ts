@@ -27,6 +27,45 @@ test("blocks editing after load failure and retries the authoritative load", asy
   await expect(page.getByLabel("API Key")).toBeVisible();
 });
 
+test("renders Windows shortcuts, lifecycle and credential storage without macOS leftovers", async ({ page }) => {
+  await page.goto("/?platform=windows");
+
+  await expect(page.getByText("Windows · Tauri", { exact: true })).toBeVisible();
+  await expect(page.getByRole("region", { name: "运行状态" })).toContainText("Ctrl+Alt+T 可用");
+  await expect(page.getByRole("region", { name: "运行状态" })).toContainText(
+    "尚未在 Windows 凭据管理器中保存 API Key"
+  );
+  await expect(page.getByText("Ctrl + Alt + T", { exact: true })).toBeVisible();
+  await expect(page.getByText("Ctrl + C + C", { exact: true })).toBeVisible();
+  await expect(page.getByText("可从系统托盘重新打开", { exact: false })).toBeVisible();
+  await page.getByText("本地处理与数据", { exact: true }).click();
+  await expect(page.getByText("缓存包含原文与译文，最多 500 条并在 7 天后自动清理。", { exact: true })).toBeVisible();
+  await expect(page.getByText("卸载默认保留设置、缓存和系统凭据", { exact: false })).toBeVisible();
+  await expect(page.getByLabel(/启用 Windows 选区取词/)).toBeChecked();
+  await expect(page.getByLabel(/鼠标主动划词后显示/)).not.toBeChecked();
+  await expect(page.getByRole("note", { name: "浮窗关闭规则" })).toContainText(
+    "同一选区保持静默"
+  );
+  await expect(page.getByText("成功读取的文字会按当前设置发送给模型提供方", { exact: false })).toBeVisible();
+  await expect(page.getByText(/Cmd\+Q|Dock|系统钥匙串|Cmd\+C\+C/)).toHaveCount(0);
+});
+
+test("requires an explicit Windows opt-in before reporting automatic selection ready", async ({ page }) => {
+  await page.goto("/?platform=windows");
+  const automaticSelection = page.getByLabel(/鼠标主动划词后显示/);
+
+  await page.locator("label.switch-row").filter({ hasText: "鼠标主动划词后显示" }).click();
+  await expect(page.getByText("草稿尚未保存")).toBeVisible();
+  await page.getByRole("button", { name: "保存设置" }).click();
+
+  await expect(automaticSelection).toBeChecked();
+  await expect(page.getByRole("region", { name: "运行状态" })).toContainText(
+    "鼠标划词 + Ctrl+Alt+T 可用"
+  );
+  await expect(page.getByText("鼠标划词、Ctrl+Alt+T 与 Ctrl+C+C", { exact: false })).toBeVisible();
+  await expect(page.getByText("复制粘贴、键盘选择和程序改动选区都不会自动弹出", { exact: false })).toBeVisible();
+});
+
 test("recovers a persistent load mismatch by safely applying the disk snapshot", async ({ page }) => {
   await page.goto("/?fail=load&runtime=external-settings-on-refresh");
   await expect(page.getByRole("alert")).toContainText("无法读取当前设置");
@@ -87,6 +126,7 @@ test("shows disabled selection as an effective source shutdown while keeping Cmd
   await page.locator("label.switch-row").filter({ hasText: "拖选后显示操作浮窗" }).click();
   await page.getByRole("button", { name: "保存设置" }).click();
   await expect(page.getByRole("region", { name: "运行状态" })).toContainText("完整可用");
+  await page.getByText("查看运行诊断", { exact: true }).click();
   await expect(page.getByText("鼠标 tap", { exact: true })).toBeVisible();
 });
 

@@ -40,6 +40,10 @@ export function normalizeSettings(raw: Partial<AppSettings>): AppSettings {
       typeof raw.enableSelectionPopup === "boolean"
         ? raw.enableSelectionPopup
         : DEFAULT_SETTINGS.enableSelectionPopup,
+    enableAutomaticSelection:
+      typeof raw.enableAutomaticSelection === "boolean"
+        ? raw.enableAutomaticSelection
+        : DEFAULT_SETTINGS.enableAutomaticSelection,
     targetLanguage: normalizeTargetLanguage(raw.targetLanguage, DEFAULT_SETTINGS.targetLanguage),
     popupWidth: normalizePopupWidth(raw.popupWidth)
   };

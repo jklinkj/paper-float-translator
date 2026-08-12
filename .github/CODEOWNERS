@@ -1,0 +1,10 @@
+# Build, release, signing, and policy files require maintainer review.
+* @jklinkj
+
+/.github/ @jklinkj
+/CODE_SIGNING_POLICY.md @jklinkj
+/PRIVACY.md @jklinkj
+/SECURITY.md @jklinkj
+/deny.toml @jklinkj
+/apps/desktop/src-tauri/tauri*.json @jklinkj
+/apps/desktop/src-tauri/windows/ @jklinkj

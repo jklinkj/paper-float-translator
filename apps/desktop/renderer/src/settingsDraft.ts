@@ -14,6 +14,7 @@ export function hasUnsavedSettingsChanges(
     saved.cleanPdfText !== draft.cleanPdfText ||
     saved.enableCache !== draft.enableCache ||
     saved.enableSelectionPopup !== draft.enableSelectionPopup ||
+    saved.enableAutomaticSelection !== draft.enableAutomaticSelection ||
     saved.targetLanguage !== draft.targetLanguage
   );
 }

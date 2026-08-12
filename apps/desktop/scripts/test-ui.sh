@@ -2,4 +2,4 @@
 set -euo pipefail
 
 npm run build:renderer -w @paper-float-translator/desktop
-npx playwright test
+npm run check:ui

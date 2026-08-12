@@ -2,11 +2,14 @@ import type { SettingsPayload } from "./desktopApi";
 
 export function getSettingsRuntimeWarning(payload: SettingsPayload): string | null {
   const warnings = new Set<string>();
+  const copyShortcut = payload.runtimePlatform === "windows" ? "Ctrl+C+C" : "Cmd+C+C";
   if (payload.runtimeWarning) {
     warnings.add(payload.runtimeWarning);
   }
-  if (!payload.doubleCopyStatus.running) {
-    warnings.add(`Cmd+C+C 监听当前不可用：${payload.doubleCopyStatus.message}`);
+  const intentionallyDisabled =
+    !payload.settings.enableSelectionPopup && payload.doubleCopyStatus.code === "selection_disabled";
+  if (!payload.doubleCopyStatus.running && !intentionallyDisabled) {
+    warnings.add(`${copyShortcut} 监听当前不可用：${payload.doubleCopyStatus.message}`);
   }
   if (
     !payload.settings.enableSelectionPopup &&

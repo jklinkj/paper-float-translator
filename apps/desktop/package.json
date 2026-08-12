@@ -1,13 +1,22 @@
 {
   "name": "@paper-float-translator/desktop",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
+  "license": "Apache-2.0",
+  "author": "Jinke Lin and Paper Float Translator contributors",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jklinkj/paper-float-translator.git",
+    "directory": "apps/desktop"
+  },
   "scripts": {
     "dev": "tauri dev",
+    "dev:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/windows-tauri.ps1 dev",
     "build:core": "npm run build -w @paper-float-translator/core",
     "dev:renderer": "npm run build:core && vite --host 127.0.0.1 --port 1420",
     "build": "tauri build",
+    "build:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/windows-tauri.ps1 build",
     "build:renderer": "npm run build:core && vite build",
     "build:mac:app": "tauri build --bundles app",
     "build:mac:app:local": "CARGO_TARGET_DIR=src-tauri/target/local-api-key-file tauri build --bundles app --features local-api-key-file --config '{\"bundle\":{\"macOS\":{\"signingIdentity\":\"-\"}}}'",
@@ -21,8 +30,8 @@
     "verify:mac:artifact-isolation": "bash scripts/verify-mac-artifact-isolation.sh"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.0.0",
     "@paper-float-translator/core": "0.1.0",
+    "@tauri-apps/api": "^2.0.0",
     "lucide-react": "^0.468.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
@@ -30,6 +39,7 @@
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0",
     "@vitejs/plugin-react": "^4.4.1",
+    "rollup-plugin-license": "^3.7.1",
     "vite": "^6.3.2"
   }
 }
