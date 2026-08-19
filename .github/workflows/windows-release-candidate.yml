@@ -28,7 +28,7 @@ jobs:
 
     steps:
       - name: Check out the selected source revision
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
@@ -87,7 +87,7 @@ jobs:
 
     steps:
       - name: Check out the selected source revision
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
