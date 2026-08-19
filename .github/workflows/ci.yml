@@ -43,7 +43,7 @@ jobs:
           toolchain: 1.97.1
 
       - name: Install pinned cargo-about
-        uses: taiki-e/install-action@v2.85.11
+        uses: taiki-e/install-action@v2.86.1
         with:
           tool: cargo-about@0.9.1
           fallback: none
