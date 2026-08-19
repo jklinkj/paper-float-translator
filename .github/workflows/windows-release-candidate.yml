@@ -187,7 +187,7 @@ jobs:
           subject-path: release-candidate/*-setup.exe
 
       - name: Upload unsigned candidate bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: paper-float-translator-${{ inputs.version }}-windows-unsigned
           path: release-candidate/
